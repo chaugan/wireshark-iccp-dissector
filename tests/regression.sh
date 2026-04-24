@@ -94,6 +94,30 @@ assert_count "associations 1 + 2 never confirm ICCP" \
     'frame.number <= 35 and iccp.association.state == "Confirmed ICCP"' 0
 
 echo
+echo "== Report summaries (iccp.report.*) =="
+assert_has "Read-Response carries point count"          'iccp.report.point_count'
+assert_has "Every Read-Response had failure_count > 0"  'iccp.operation == "Read-Response" and iccp.report.failure_count > 0'
+# test server returns 'object-non-existent' for every variable, so
+# every response should have 1 point and 1 failure
+assert_count "18 all-failure Read-Responses" \
+    'iccp.operation == "Read-Response" and iccp.report.failure_count == iccp.report.point_count' 18
+
+echo
+echo "== Stats tree (iccp,tree) =="
+tree_out=$(tshark -r "$PCAP" "${DECODE[@]}" -q -z iccp,tree 2>/dev/null)
+for node in Operation 'Object category' 'Conformance Block' 'Association state' 'Device sub-operation' 'Report outcomes'; do
+    if grep -q "^$node" <<< "$tree_out"; then pass "stats tree has '$node' axis"
+    else fail "stats tree missing '$node' axis"
+    fi
+done
+# The tree should report the SBO state transitions we expect.
+for sub in Select SBO-Operate Cancel Tag Direct-Operate; do
+    if grep -qE "^ +$sub\b" <<< "$tree_out"; then pass "device sub-op '$sub' counted"
+    else fail "device sub-op '$sub' missing"
+    fi
+done
+
+echo
 if [[ $fails -eq 0 ]]; then
     echo "=== all checks passed ==="
     exit 0

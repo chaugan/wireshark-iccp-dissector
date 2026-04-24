@@ -51,6 +51,11 @@
 #include <epan/conversation.h>
 #include <epan/expert.h>
 #include <epan/ftypes/ftypes.h>
+#include <epan/address_types.h>
+#include <epan/to_str.h>
+#include <epan/tap.h>
+#include <epan/stats_tree.h>
+#include <wsutil/wmem/wmem_map.h>
 
 #include <string.h>
 
@@ -70,6 +75,14 @@ static int hf_iccp_conformance_block = -1;
 static int hf_iccp_device_state      = -1;
 static int hf_iccp_note              = -1;
 
+/* Report-payload summary fields, populated on InformationReport /
+ * Read-Response PDUs. */
+static int hf_iccp_report_points     = -1;
+static int hf_iccp_report_success    = -1;
+static int hf_iccp_report_failure    = -1;
+static int hf_iccp_report_structured = -1;
+static int hf_iccp_report_summary    = -1;
+
 static gint ett_iccp         = -1;
 static gint ett_iccp_objects = -1;
 static gint ett_iccp_device  = -1;
@@ -82,6 +95,37 @@ static expert_field ei_iccp_device_no_select   = EI_INIT;
 static expert_field ei_iccp_device_stale_sel   = EI_INIT;
 
 static dissector_handle_t iccp_handle;
+static int proto_iccp_tap = -1;
+
+/* Stats tree identifiers (one -z menu per axis of analysis). */
+static int st_node_ops        = -1;
+static int st_node_categories = -1;
+static int st_node_blocks     = -1;
+static int st_node_assocs     = -1;
+static int st_node_devices    = -1;
+static int st_node_reports    = -1;
+
+/* Tap payload: everything a listener (stats_tree, custom Lua tap, an
+ * external analysis) might reasonably want to know about a single ICCP
+ * packet. Allocated from pinfo->pool (the per-packet wmem scope), so
+ * listeners must copy any pointer they need to retain. */
+typedef struct {
+    int            op;             /* iccp_op_t */
+    const char    *op_str;
+    int            assoc_state;    /* iccp_assoc_state_t */
+    guint8         cb;             /* 0 if no ICCP category match */
+    const char    *object_category;
+    const char    *object_name;
+    const char    *device_name;
+    int            device_state;   /* iccp_dev_state_t, valid iff device_name != NULL */
+    const char    *device_sub;     /* Select / SBO-Operate / Direct-Operate / Cancel / Tag / ... */
+    /* Report accounting (0 on PDUs that are not Read-Response /
+     * InformationReport / Write-Response). */
+    guint32        report_points;
+    guint32        report_success;
+    guint32        report_failure;
+    gboolean       report_structured;
+} iccp_tap_info_t;
 
 /* We do not cache MMS hf indices: walk_tree() matches fields by
  * hfinfo->abbrev because asn2wrs registers duplicate hfs for the same
@@ -265,20 +309,29 @@ typedef enum {
 } iccp_dev_state_t;
 
 typedef struct iccp_device_entry {
-    char                      name[64]; /* prefix before the SBO/Operate suffix */
-    iccp_dev_state_t          state;
-    guint32                   select_frame;
-    struct iccp_device_entry *next;
+    char             name[64]; /* device base name (prefix before SBO suffix) */
+    char             server[64]; /* server endpoint as "addr:port" */
+    iccp_dev_state_t state;
+    guint32          select_frame;       /* frame in which Select was seen */
+    guint32          select_conv_index;  /* conversation index where Select happened */
 } iccp_device_entry_t;
 
 typedef struct {
-    iccp_assoc_state_t   state;
-    guint32              initiate_frame;
-    guint32              confirmed_frame;
-    char                 confirmation_name[64];
-    guint8               confirmation_cb;
-    iccp_device_entry_t *devices;
+    iccp_assoc_state_t state;
+    guint32            initiate_frame;
+    guint32            confirmed_frame;
+    char               confirmation_name[64];
+    guint8             confirmation_cb;
 } iccp_conv_t;
+
+/* Cross-conversation device state: every device observed across the whole
+ * capture, keyed by "<server_addr>:<server_port>#<device_base_name>".
+ * Real ICCP SBO correlations happen on a single persistent association,
+ * but some deployments split Select and Operate onto separate
+ * associations to the same server -- this table makes that case
+ * traceable. Stored in wmem_file_scope so it lives as long as the
+ * capture file is open. Initialised lazily. */
+static wmem_map_t *g_devices = NULL;
 
 static iccp_conv_t *
 iccp_conv_get(packet_info *pinfo, gboolean create)
@@ -292,6 +345,35 @@ iccp_conv_get(packet_info *pinfo, gboolean create)
         conversation_add_proto_data(conv, proto_iccp, info);
     }
     return info;
+}
+
+/* Identify the server side of the current packet's TCP flow. ICCP
+ * servers listen on a well-known ISO-TSAP port (102, or a vendor
+ * non-standard one), which is numerically smaller than the client's
+ * ephemeral port. Pick the lower port as server. This is a heuristic
+ * that is correct for every real ICCP capture the author has seen.
+ * Writes "<addr>:<port>" into dst. */
+static void
+iccp_server_endpoint_str(packet_info *pinfo, char *dst, size_t buf_sz)
+{
+    const address *addr;
+    guint32        port;
+    if (pinfo->srcport < pinfo->destport) {
+        addr = &pinfo->src;
+        port = pinfo->srcport;
+    } else {
+        addr = &pinfo->dst;
+        port = pinfo->destport;
+    }
+    const char *a = address_to_str(pinfo->pool, addr);
+    g_snprintf(dst, buf_sz, "%s:%u", a ? a : "?", port);
+}
+
+/* Compose the hash key used in g_devices. */
+static char *
+iccp_device_key(wmem_allocator_t *scope, const char *server, const char *base)
+{
+    return wmem_strdup_printf(scope, "%s#%s", server, base);
 }
 
 /* Strip the ICCP control suffix from a device object name to get the
@@ -327,18 +409,31 @@ iccp_device_base_name(const char *name, char *dst, size_t buf_sz)
 }
 
 static iccp_device_entry_t *
-iccp_device_lookup(iccp_conv_t *info, const char *base_name, gboolean create)
+iccp_device_lookup(packet_info *pinfo, const char *base_name, gboolean create)
 {
-    if (!info || !base_name) return NULL;
-    for (iccp_device_entry_t *e = info->devices; e; e = e->next) {
-        if (strcmp(e->name, base_name) == 0) return e;
+    if (!base_name) return NULL;
+
+    if (!g_devices) {
+        g_devices = wmem_map_new(wmem_file_scope(), g_str_hash, g_str_equal);
     }
-    if (!create) return NULL;
-    iccp_device_entry_t *e = wmem_new0(wmem_file_scope(), iccp_device_entry_t);
-    g_strlcpy(e->name, base_name, sizeof e->name);
+
+    char server[64];
+    iccp_server_endpoint_str(pinfo, server, sizeof server);
+
+    /* Use packet scope for the lookup key; use file scope only for the
+     * stored key if we end up inserting. */
+    char *lookup_key = iccp_device_key(pinfo->pool, server, base_name);
+
+    iccp_device_entry_t *e = (iccp_device_entry_t *)wmem_map_lookup(g_devices, lookup_key);
+    if (e || !create) return e;
+
+    e = wmem_new0(wmem_file_scope(), iccp_device_entry_t);
+    g_strlcpy(e->name,   base_name, sizeof e->name);
+    g_strlcpy(e->server, server,    sizeof e->server);
     e->state = ICCP_DEV_IDLE;
-    e->next  = info->devices;
-    info->devices = e;
+
+    char *stored_key = iccp_device_key(wmem_file_scope(), server, base_name);
+    wmem_map_insert(g_devices, stored_key, e);
     return e;
 }
 
@@ -377,6 +472,19 @@ typedef struct {
     gboolean has_get_var_attr;
     gboolean has_define_nvl;
     gboolean has_delete_nvl;
+    /* Report / typed-data accounting, populated for every packet the
+     * MMS dissector decoded. These are counts of mms.* occurrences in
+     * the tree; we use them to surface useful per-report summaries
+     * under iccp.report.* on InformationReport / Read-Response PDUs. */
+    guint32  access_result_count;
+    guint32  success_count;
+    guint32  failure_count;
+    guint32  structure_count;
+    guint32  floating_point_count;
+    guint32  bit_string_count;
+    guint32  binary_time_count;
+    guint32  visible_string_count;
+    guint32  octet_string_count;
 } iccp_pdu_flags_t;
 
 typedef struct {
@@ -443,6 +551,21 @@ walk_tree(proto_tree *tree, iccp_pdu_flags_t *flags, iccp_name_scan_t *scan)
         else if (!strcmp(s, "getVariableAccessAttributes_element")) flags->has_get_var_attr = TRUE;
         else if (!strcmp(s, "defineNamedVariableList_element"))     flags->has_define_nvl   = TRUE;
         else if (!strcmp(s, "deleteNamedVariableList_element"))     flags->has_delete_nvl   = TRUE;
+        /* Data / Report accounting. These are cumulative per-packet
+         * counters; caller decides whether to surface them (typically
+         * only for InformationReport / Read-Response PDUs). */
+        else if (!strcmp(s, "AccessResult"))        flags->access_result_count++;
+        /* mms.failure (FT_INT32) fires once per failed AccessResult.
+         * The MMS dissector does not emit a corresponding
+         * mms.success_element, so we derive the success count as
+         * total AccessResult items minus failure count. */
+        else if (!strcmp(s, "failure"))             flags->failure_count++;
+        else if (!strcmp(s, "structure_element"))   flags->structure_count++;
+        else if (!strcmp(s, "floating_point"))      flags->floating_point_count++;
+        else if (!strcmp(s, "data_bit-string"))     flags->bit_string_count++;
+        else if (!strcmp(s, "data.binary-time"))    flags->binary_time_count++;
+        else if (!strcmp(s, "data.visible-string")) flags->visible_string_count++;
+        else if (!strcmp(s, "data.octet-string"))   flags->octet_string_count++;
         else if (!strcmp(s, "Identifier")
               || !strcmp(s, "itemId")
               || !strcmp(s, "vmd_specific")
@@ -536,11 +659,17 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
         if (dev_sub) {
             char base[64];
             iccp_device_base_name(scan.matched_name, base, sizeof base);
-            dev = iccp_device_lookup(info, base, TRUE);
+            /* Cross-conversation lookup: Select on conversation A will
+             * correlate with Operate on conversation B if they target
+             * the same (server_addr, server_port, device_base). */
+            dev = iccp_device_lookup(pinfo, base, TRUE);
             if (dev) {
+                conversation_t *conv = find_conversation_pinfo(pinfo, 0);
+                guint32 conv_idx = conv ? conv->conv_index : 0;
                 if (strcmp(dev_sub, "Select") == 0) {
-                    dev->state        = ICCP_DEV_SELECTED;
-                    dev->select_frame = pinfo->num;
+                    dev->state             = ICCP_DEV_SELECTED;
+                    dev->select_frame      = pinfo->num;
+                    dev->select_conv_index = conv_idx;
                 } else if (strcmp(dev_sub, "SBO-Operate") == 0) {
                     if (dev->state != ICCP_DEV_SELECTED)
                         dev_bad_operate = TRUE;
@@ -632,6 +761,50 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
         expert_add_info(pinfo, ti, &ei_iccp_info_report);
     }
 
+    /* Report / typed-data summary. We don't re-parse the BER -- the MMS
+     * dissector already did that -- but we surface the counts MMS
+     * emitted so users can e.g. filter for
+     *   iccp.report.point_count > 50
+     * or spot a partially-failed report via iccp.report.failure_count.
+     * Applied on any PDU that carries MMS AccessResults (i.e. a
+     * Read-Response or an InformationReport), on a confirmed ICCP
+     * conversation. */
+    if (flags.access_result_count > 0
+        && (op == ICCP_OP_INFORMATION_REPORT
+         || op == ICCP_OP_READ_RESP
+         || op == ICCP_OP_WRITE_RESP)) {
+        proto_item *pit = proto_tree_add_uint(itree, hf_iccp_report_points,
+                                              tvb, 0, 0, flags.access_result_count);
+        proto_item_set_generated(pit);
+        guint32 succ = (flags.failure_count <= flags.access_result_count)
+                     ? (flags.access_result_count - flags.failure_count) : 0;
+        proto_item *sit = proto_tree_add_uint(itree, hf_iccp_report_success,
+                                              tvb, 0, 0, succ);
+        proto_item_set_generated(sit);
+        proto_item *fit = proto_tree_add_uint(itree, hf_iccp_report_failure,
+                                              tvb, 0, 0, flags.failure_count);
+        proto_item_set_generated(fit);
+        /* A TASE.2 DSConditions point is always a structure of several
+         * primitives (at minimum: value + quality + timestamp). Treat
+         * the presence of at least one structure as strong evidence. */
+        gboolean structured = (flags.structure_count > 0);
+        proto_item *bit = proto_tree_add_boolean(itree, hf_iccp_report_structured,
+                                                 tvb, 0, 0, structured);
+        proto_item_set_generated(bit);
+
+        char summary[160];
+        g_snprintf(summary, sizeof summary,
+                   "floats=%u bit-strings=%u binary-times=%u visible-strings=%u octet-strings=%u",
+                   flags.floating_point_count,
+                   flags.bit_string_count,
+                   flags.binary_time_count,
+                   flags.visible_string_count,
+                   flags.octet_string_count);
+        proto_item *sumit = proto_tree_add_string(itree, hf_iccp_report_summary,
+                                                  tvb, 0, 0, summary);
+        proto_item_set_generated(sumit);
+    }
+
     /* Device sub-tree. */
     if (dev) {
         proto_item *dti = proto_tree_add_string(itree, hf_iccp_device_state,
@@ -661,7 +834,110 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
         }
     }
 
+    /* Queue tap_info for any listener (stats_tree, custom tap, Lua tap)
+     * interested in ICCP packet attributes. Packet-scope allocation:
+     * listeners must copy anything they want to keep. */
+    if (have_tap_listener(proto_iccp_tap)) {
+        iccp_tap_info_t *ti2 = wmem_new0(pinfo->pool, iccp_tap_info_t);
+        ti2->op              = (int)op;
+        ti2->op_str          = iccp_op_str(op);
+        ti2->assoc_state     = (int)info->state;
+        if (scan.matched) {
+            ti2->cb              = scan.matched->cb;
+            ti2->object_category = scan.matched->category;
+            ti2->object_name     = scan.matched_name;
+        }
+        if (dev) {
+            ti2->device_name  = dev->name;
+            ti2->device_state = (int)dev->state;
+            ti2->device_sub   = dev_sub;
+        }
+        if (flags.access_result_count > 0
+            && (op == ICCP_OP_INFORMATION_REPORT
+             || op == ICCP_OP_READ_RESP
+             || op == ICCP_OP_WRITE_RESP)) {
+            ti2->report_points     = flags.access_result_count;
+            ti2->report_failure    = flags.failure_count;
+            ti2->report_success    = (flags.failure_count <= flags.access_result_count)
+                                   ? (flags.access_result_count - flags.failure_count) : 0;
+            ti2->report_structured = (flags.structure_count > 0);
+        }
+        tap_queue_packet(proto_iccp_tap, pinfo, ti2);
+    }
+
     return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Stats tree callbacks
+ *
+ * Registered as a stats_tree plugin under the name "iccp,tree" so
+ * users can run:   tshark -r file.pcap -z iccp,tree
+ * and get a hierarchical summary of what the ICCP post-dissector saw.
+ * ---------------------------------------------------------------------- */
+
+static void
+iccp_stats_tree_init(stats_tree *st)
+{
+    st_node_ops        = stats_tree_create_node(st, "Operation",          0, STAT_DT_INT, TRUE);
+    st_node_categories = stats_tree_create_node(st, "Object category",    0, STAT_DT_INT, TRUE);
+    st_node_blocks     = stats_tree_create_node(st, "Conformance Block",  0, STAT_DT_INT, TRUE);
+    st_node_assocs     = stats_tree_create_node(st, "Association state",  0, STAT_DT_INT, TRUE);
+    st_node_devices    = stats_tree_create_node(st, "Device sub-operation", 0, STAT_DT_INT, TRUE);
+    st_node_reports    = stats_tree_create_node(st, "Report outcomes",     0, STAT_DT_INT, TRUE);
+}
+
+static tap_packet_status
+iccp_stats_tree_packet(stats_tree *st,
+                       packet_info *pinfo _U_,
+                       epan_dissect_t *edt _U_,
+                       const void *p,
+                       tap_flags_t flags _U_)
+{
+    const iccp_tap_info_t *ti = (const iccp_tap_info_t *)p;
+    if (!ti) return TAP_PACKET_DONT_REDRAW;
+
+    if (ti->op_str && *ti->op_str) {
+        tick_stat_node(st, "Operation",          0, TRUE);
+        tick_stat_node(st, ti->op_str, st_node_ops, FALSE);
+    }
+    if (ti->object_category && *ti->object_category) {
+        tick_stat_node(st, "Object category",    0, TRUE);
+        tick_stat_node(st, ti->object_category, st_node_categories, FALSE);
+    }
+    if (ti->cb > 0) {
+        char cb_label[16];
+        g_snprintf(cb_label, sizeof cb_label, "Block %u", ti->cb);
+        tick_stat_node(st, "Conformance Block",  0, TRUE);
+        tick_stat_node(st, cb_label, st_node_blocks, FALSE);
+    }
+    {
+        const char *assoc =
+            ti->assoc_state == ICCP_ASSOC_CONFIRMED ? "Confirmed ICCP" :
+            ti->assoc_state == ICCP_ASSOC_CANDIDATE ? "Candidate"      :
+            "Unknown";
+        tick_stat_node(st, "Association state",  0, TRUE);
+        tick_stat_node(st, assoc, st_node_assocs, FALSE);
+    }
+    if (ti->device_sub && *ti->device_sub) {
+        tick_stat_node(st, "Device sub-operation", 0, TRUE);
+        tick_stat_node(st, ti->device_sub, st_node_devices, FALSE);
+    }
+    if (ti->report_points > 0) {
+        tick_stat_node(st, "Report outcomes",    0, TRUE);
+        if (ti->report_failure == ti->report_points) {
+            tick_stat_node(st, "all-failures",        st_node_reports, FALSE);
+        } else if (ti->report_failure == 0) {
+            tick_stat_node(st, "all-success",         st_node_reports, FALSE);
+        } else {
+            tick_stat_node(st, "partial (mixed success/failure)", st_node_reports, FALSE);
+        }
+        if (ti->report_structured) {
+            tick_stat_node(st, "structured (TASE.2-shaped)", st_node_reports, FALSE);
+        }
+    }
+
+    return TAP_PACKET_REDRAW;
 }
 
 /* -------------------------------------------------------------------------
@@ -712,6 +988,41 @@ proto_register_iccp(void)
           { "Note", "iccp.note",
             FT_STRING, BASE_NONE, NULL, 0x0,
             NULL, HFILL }
+        },
+        { &hf_iccp_report_points,
+          { "Report points", "iccp.report.point_count",
+            FT_UINT32, BASE_DEC, NULL, 0x0,
+            "Number of AccessResult items in this report PDU "
+            "(one per reported data point)",
+            HFILL }
+        },
+        { &hf_iccp_report_success,
+          { "Successful points", "iccp.report.success_count",
+            FT_UINT32, BASE_DEC, NULL, 0x0,
+            "Number of AccessResult items that decoded successfully",
+            HFILL }
+        },
+        { &hf_iccp_report_failure,
+          { "Failed points", "iccp.report.failure_count",
+            FT_UINT32, BASE_DEC, NULL, 0x0,
+            "Number of AccessResult items that returned a failure "
+            "reason (object undefined, access denied, etc.)",
+            HFILL }
+        },
+        { &hf_iccp_report_structured,
+          { "Structured TASE.2 data", "iccp.report.structured",
+            FT_BOOLEAN, BASE_NONE, NULL, 0x0,
+            "TRUE when the report points are MMS structures, which is "
+            "the canonical shape of a TASE.2 DSConditions report "
+            "(value + quality + timestamp + COT per point)",
+            HFILL }
+        },
+        { &hf_iccp_report_summary,
+          { "Report data summary", "iccp.report.summary",
+            FT_STRING, BASE_NONE, NULL, 0x0,
+            "Human-readable breakdown of primitive data values present "
+            "in the report (floats, bit-strings, binary-times, ...)",
+            HFILL }
         },
     };
 
@@ -765,6 +1076,22 @@ proto_register_iccp(void)
 
     iccp_handle = create_dissector_handle(dissect_iccp, proto_iccp);
     register_postdissector(iccp_handle);
+
+    /* Expose a tap so external listeners (stats_tree, Lua, custom taps)
+     * can consume per-packet ICCP attributes. */
+    proto_iccp_tap = register_tap("iccp");
+
+    /* Register the built-in stats tree. Enables:
+     *   tshark -z iccp,tree -r file.pcap
+     * and the same node under Statistics -> ICCP in the GUI. */
+    /* Third arg is the abbrev. Wireshark auto-appends ",tree" when
+     * listing -z options, so passing "iccp" yields "iccp,tree" on the
+     * command line. */
+    stats_tree_register_plugin("iccp", "iccp", "ICCP/Statistics",
+                               0,
+                               iccp_stats_tree_packet,
+                               iccp_stats_tree_init,
+                               NULL);
 }
 
 void
@@ -803,6 +1130,15 @@ proto_reg_handoff_iccp(void)
         "mms.domainId",
         "mms.domainSpecific",
         "mms.newIdentifier",
+        /* Data-payload accounting (for iccp.report.* summary fields). */
+        "mms.AccessResult",
+        "mms.failure",
+        "mms.structure_element",
+        "mms.floating_point",
+        "mms.data_bit-string",
+        "mms.data.binary-time",
+        "mms.data.visible-string",
+        "mms.data.octet-string",
         NULL
     };
 

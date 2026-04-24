@@ -223,6 +223,44 @@ bash tests/regression.sh
 the Device-Control state machine, and the no-false-positive guard
 (plain-MMS Initiate doesn't promote to Confirmed ICCP).
 
+## Code-signing the Windows DLL (optional)
+
+Some corporate Wireshark installs refuse to load unsigned plugins.
+`scripts/win-sign.ps1` wraps `signtool.exe` from the Windows SDK and
+covers three cert sources:
+
+```powershell
+# (A) Dev self-signed -- good for local testing on your own machine
+.\scripts\win-sign.ps1 -DevSelfSigned
+
+# (B) A purchased cert already imported to Cert:\CurrentUser\My
+.\scripts\win-sign.ps1 -CertThumbprint 1234567890ABCDEF...
+
+# (C) A PFX file on disk
+.\scripts\win-sign.ps1 -PfxFile my-codesign.pfx `
+                       -PfxPassword (Read-Host -AsSecureString -Prompt 'pfx pw')
+```
+
+The script always adds an RFC 3161 timestamp (default
+`http://timestamp.digicert.com`) so the signature stays valid after
+the cert expires.
+
+**Which cert to get:**
+
+- **Self-signed** is fine for solo dev loop but every other machine
+  will still show "publisher: unknown" unless the user imports the
+  cert into Trusted Root Certification Authorities (which they
+  shouldn't).
+- **Sectigo / DigiCert / GlobalSign OV** code-signing certs are the
+  usual commercial option — around USD 100-400 per year for standard,
+  300-700 for EV. Purchase, verify identity, receive either a
+  hardware token (EV) or a PFX (standard).
+- **SignPath.Foundation** offers *free* code signing for
+  qualifying open-source projects via a CI integration
+  (<https://signpath.io/products/foundation>). Requires a GitHub
+  project meeting their criteria; once accepted the signing happens
+  server-side from the release CI pipeline.
+
 ## Using the plugin on a real-world ICCP capture
 
 Real-world TASE.2 links associate once and then stay up for days or

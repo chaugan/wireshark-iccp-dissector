@@ -81,6 +81,7 @@ run_client errorlog       -a TestDomain -r Error_Log
 run_client dev_select_A   -a TestDomain -r Device_Breaker_A_SBOSelect
 run_client dev_operate_A  -a TestDomain -r Device_Breaker_A_SBOOperate
 run_client dev_orphan_op  -a TestDomain -r Device_Line5_Operate
+run_client dev_orphan_sbo -a TestDomain -r Device_Orphan_SBOOperate
 run_client dev_cancel_A   -a TestDomain -r Device_Breaker_A_Cancel
 run_client dev_tag_Z      -a TestDomain -r Device_Switch_Z_TagOperate
 
