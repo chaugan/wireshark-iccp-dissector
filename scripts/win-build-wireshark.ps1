@@ -61,9 +61,27 @@ Set-Location $BuildDir
 if (-not (Test-Path 'CMakeCache.txt')) {
     Write-Host ""
     Write-Host "=== CMake configure ==="
+    # BUILD_* = OFF flags skip the Qt6 GUI, auxiliary CLI tools, and
+    # extcap helpers -- we only need the three libs (libwireshark,
+    # libwsutil, libwiretap) plus the CMake package files so our
+    # plugin can link. Cuts both build time and the Qt6 dependency.
     cmake -G 'Visual Studio 17 2022' -A x64 `
         -DWIRESHARK_BASE_DIR=(Split-Path -Parent $LibsDir) `
         -DDISABLE_WERROR=ON `
+        -DBUILD_wireshark=OFF `
+        -DBUILD_logwolf=OFF `
+        -DBUILD_rawshark=OFF `
+        -DBUILD_randpkt=OFF `
+        -DBUILD_dftest=OFF `
+        -DBUILD_sharkd=OFF `
+        -DBUILD_androiddump=OFF `
+        -DBUILD_sshdump=OFF `
+        -DBUILD_ciscodump=OFF `
+        -DBUILD_udpdump=OFF `
+        -DBUILD_wifidump=OFF `
+        -DBUILD_dpauxmon=OFF `
+        -DBUILD_randpktdump=OFF `
+        -DBUILD_etwdump=OFF `
         $SourceDir
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } else {

@@ -40,9 +40,13 @@ New-Item -ItemType Directory -Path $PluginBuild -Force | Out-Null
 Set-Location $PluginBuild
 
 Write-Host ""
-Write-Host "=== configure (CMAKE_PREFIX_PATH=$WiresharkInstall) ==="
+Write-Host "=== configure (Wireshark_DIR=$WiresharkInstall\cmake) ==="
+# CMake 4.x no longer searches <prefix>/cmake/<pkg>Config.cmake by
+# default -- only <prefix>/lib/cmake/<pkg>/ or <prefix>/<pkg>*/.
+# Wireshark installs to <prefix>/cmake/ on Windows, so we point
+# Wireshark_DIR at it directly instead of relying on CMAKE_PREFIX_PATH.
 cmake -G 'Visual Studio 17 2022' -A x64 `
-    -DCMAKE_PREFIX_PATH=$WiresharkInstall `
+    -DWireshark_DIR="$WiresharkInstall\cmake" `
     $pluginSrc
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
