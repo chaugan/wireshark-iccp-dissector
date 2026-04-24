@@ -91,10 +91,29 @@ def parse_global_header(data: bytes):
 class Washer:
     LINKTYPE_ETHERNET = 1
 
-    # MMS identifiers (ISO 9506): VisibleString content must be from
-    # <letter> <digit> $ _ but in practice dots and hyphens show up
-    # too. We use a permissive set.
-    IDCHARS = set(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$-.")
+    # "Printable ASCII" for string detection. Everything 0x20..0x7e
+    # except control characters.
+    IDCHARS = set(bytes(range(0x20, 0x7f)))
+
+    # BER primitive tags that we refuse to touch even if the content
+    # looks printable. OID (tag 0x06) identifies protocol / abstract
+    # syntax; rewriting it breaks MMS dispatch. Integer / Real /
+    # BitString can occasionally look printable by coincidence and
+    # carry semantic payload (operational data values).
+    #
+    # We DO rewrite everything else whose content is printable ASCII:
+    # universal string types (OctetString, PrintableString,
+    # UTF8String, VisibleString, ...), context-specific primitive
+    # tags (0x80..0x9f; these hold "[n] IMPLICIT VisibleString" in
+    # many MMS PDUs, which is how mms.vmd_specific / mms.domainId etc.
+    # actually encode on the wire), and application-class tags.
+    SKIP_TAGS = frozenset([
+        0x02,  # INTEGER
+        0x03,  # BIT STRING
+        0x06,  # OID
+        0x09,  # REAL
+        0x0A,  # ENUMERATED
+    ])
 
     # Names that appear in IEC 60870-6-503 and reveal no operational
     # identity; keep them so the washed capture stays instantly
@@ -105,14 +124,20 @@ class Washer:
         "Bilateral_Table_ID",
     ])
 
-    def __init__(self, preserve_extra=None, scrub_values=False,
-                 min_string_len=4, max_string_len=127):
+    def __init__(self, preserve_extra=None, salt=None,
+                 min_string_len=4, max_string_len=1024):
         self.ip_map  = {}
         self.mac_map = {}
         self.ip_next  = 1
         self.mac_next = 1
         self.preserved = set(self.DEFAULT_PRESERVED) | set(preserve_extra or [])
-        self.scrub_values = scrub_values
+        # Optional random salt prepended to every hashed string. Same
+        # name in one wash session maps to the same hash (so within
+        # the capture, correlations are preserved), but different
+        # washes produce different hashes -- and an attacker without
+        # the salt can't mount a dictionary attack against the
+        # washed capture to recover names.
+        self.salt = salt or b""
         self.min_len = min_string_len
         self.max_len = max_string_len
         self.stats = {
@@ -146,38 +171,61 @@ class Washer:
     # -- name rewrite ------------------------------------------------------
 
     def hash_name(self, name_bytes):
-        """Length-preserving identifier replacement."""
+        """Length-preserving replacement. Uses SHA-256 (truncated to
+        the original byte-length) with an optional per-wash salt.
+        Same input always produces the same output within one wash
+        run, so cross-references in the capture stay consistent."""
         n = len(name_bytes)
         if n == 0:
             return name_bytes
-        s = name_bytes.decode('ascii', errors='replace')
-        if s in self.preserved:
+        try:
+            s = name_bytes.decode('ascii')
+        except UnicodeDecodeError:
+            s = None
+        if s is not None and s in self.preserved:
             self.stats['strings_preserved'] += 1
             return name_bytes
-        h = hashlib.sha1(name_bytes).hexdigest()
-        # Produce "VAR_<hash>" left-padded with underscores to n chars
-        prefix = "VAR_"
-        core = (prefix + h)[:n]
+        h = hashlib.sha256(self.salt + name_bytes).hexdigest()
+        core = ("VAR_" + h)[:n]
         if len(core) < n:
             core = core + "_" * (n - len(core))
         self.stats['strings_rewritten'] += 1
         return core.encode('ascii')
 
-    def scrub_visible_strings(self, payload: bytearray):
-        """Walk `payload` looking for BER VisibleString TLVs (tag 0x1A)
-        whose content is a plausible MMS identifier, and hash-rewrite
-        them in place. Length-preserving."""
+    def scrub_strings(self, payload: bytearray):
+        """Walk `payload` looking for any BER primitive TLV whose
+        content is all-printable-ASCII of reasonable length, and
+        length-preservingly hash it. Covers universal string types
+        (OctetString 0x04, UTF8String 0x0C, VisibleString 0x1A,
+        PrintableString 0x13, ...), context-specific primitive tags
+        (0x80..0x9f, which hold "[n] IMPLICIT VisibleString" in MMS
+        ASN.1), and application-class tags. Refuses to rewrite OID,
+        Integer, Real, Enumerated, BitString (see SKIP_TAGS)."""
         i = 0
         n = len(payload)
         while i < n - 2:
-            if payload[i] != 0x1a:
+            tag = payload[i]
+
+            # Skip the tags that carry semantic non-string content.
+            if tag in self.SKIP_TAGS:
+                i += 1
+                continue
+            # Only primitive tags (P/C bit = 0) carry a leaf value.
+            # Constructed tags (P/C = 1) are containers whose children
+            # will be visited by our linear walk when we get to them.
+            if tag & 0x20:
+                i += 1
+                continue
+            # Reserved 0x00 / 0x1F (multi-byte tag marker) are not
+            # plausible for a string we want to hash.
+            if tag == 0x00 or (tag & 0x1f) == 0x1f:
                 i += 1
                 continue
 
             Lbyte = payload[i + 1]
             if Lbyte & 0x80:
                 nlen = Lbyte & 0x7f
-                if nlen == 0 or nlen > 2 or i + 2 + nlen > n:
+                if nlen == 0 or nlen > 3 or i + 2 + nlen > n:
                     i += 1
                     continue
                 length = 0
@@ -197,6 +245,9 @@ class Washer:
                 continue
 
             content = bytes(payload[vstart:vend])
+            # All bytes must be printable ASCII. This is our
+            # "it's really a string, not a coincidentally-plausible
+            # binary blob" heuristic.
             if all(b in self.IDCHARS for b in content):
                 new = self.hash_name(content)
                 if len(new) == length:
@@ -257,9 +308,9 @@ class Washer:
         hdr = bytearray(tcp[:doff])
         payload = bytearray(tcp[doff:])
 
-        # scrub the MMS VisibleStrings embedded in the TCP payload
+        # scrub string content embedded in the TCP payload
         if payload:
-            self.scrub_visible_strings(payload)
+            self.scrub_strings(payload)
 
         # recompute TCP checksum
         hdr[16:18] = b'\x00\x00'
@@ -290,13 +341,22 @@ def main():
                     "(length-preservingly) so the ASN.1 stays well-formed.")
     ap.add_argument('input_pcap',  help="input .pcap (legacy format; for pcapng, editcap -F pcap first)")
     ap.add_argument('output_pcap', help="output .pcap")
-    ap.add_argument('--scrub-values', action='store_true',
-                    help="also redact typed-data primitives (floats/ints/etc.). "
-                         "Not yet implemented; placeholder.")
     ap.add_argument('--preserve-extra', action='append', default=[],
                     help="additional identifier strings to leave untouched "
                          "(repeatable). 'TASE2_Version', 'Supported_Features', "
                          "and 'Bilateral_Table_ID' are always preserved.")
+    ap.add_argument('--salt',
+                    help="Optional salt for the hash function. When set, "
+                         "an adversary cannot mount a dictionary attack "
+                         "against the washed capture to guess the original "
+                         "names -- even if they know the naming convention "
+                         "of your utility. Use a fresh random value per wash, "
+                         "e.g. --salt $(openssl rand -hex 16). Same input "
+                         "always hashes to the same output WITHIN one run "
+                         "regardless of salt, so cross-references in the "
+                         "capture stay consistent.")
+    ap.add_argument('--min-string-len', type=int, default=4,
+                    help="Smallest BER string content length to rewrite (default 4).")
     args = ap.parse_args()
 
     data = Path(args.input_pcap).read_bytes()
@@ -310,8 +370,10 @@ def main():
     phdr_fmt = endian + 'IIII'
     phdr_sz = 16
 
+    salt = args.salt.encode() if args.salt else b""
     washer = Washer(preserve_extra=args.preserve_extra,
-                    scrub_values=args.scrub_values)
+                    salt=salt,
+                    min_string_len=args.min_string_len)
 
     out = bytearray()
     out += data[:24]  # preserve global header
