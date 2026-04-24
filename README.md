@@ -154,6 +154,26 @@ Then from a PowerShell prompt in the repo root:
 .\scripts\win-build-plugin.ps1
 ```
 
+### Optional: full GUI build
+
+Default `win-build-wireshark.ps1` is libs-only (no Qt, ~3 min build).
+If you have Qt6 under `C:\Qt\<version>\msvc*_64\` pass `-WithGui` and
+the script auto-discovers it and builds the full Wireshark GUI
+(`Wireshark.exe`) along with the libs and CLI tools. Takes ~10 min
+instead of 3 but leaves a self-contained `run\RelWithDebInfo\Wireshark.exe`
+you can launch directly:
+
+```powershell
+.\scripts\win-build-wireshark.ps1 -WithGui
+# or force a specific Qt:
+.\scripts\win-build-wireshark.ps1 -WithGui -Qt6Dir C:\Qt\6.7.2\msvc2019_64
+```
+
+Install Qt6 via https://www.qt.io/download-qt-installer (select any
+"MSVC ... 64-bit" build — msvc2019_64 works fine with MSVC 2022). The
+`Qt Core 5 Compatibility`, `Qt Multimedia`, `Qt 5 Compatibility Module`
+modules are needed.
+
 Defaults:
 
 | Path | Contents |
@@ -222,6 +242,58 @@ bash tests/regression.sh
 25 assertions covering all 9 conformance blocks, all tracked operations,
 the Device-Control state machine, and the no-false-positive guard
 (plain-MMS Initiate doesn't promote to Confirmed ICCP).
+
+## Sanitizing a real-world ICCP capture for sharing
+
+Real ICCP traffic usually contains control-center IPs, substation
+codes, breaker designations and operator usernames embedded in MMS
+VisibleString identifiers — information that's sensitive to share.
+`scripts/wash-pcap.py` rewrites the capture in place with
+length-preserving substitutions so the ASN.1 stays well-formed and
+the washed capture still dissects end-to-end.
+
+### What it rewrites
+
+| Field | Becomes |
+|-------|---------|
+| IPv4 addresses | `192.0.2.x` (RFC 5737 documentation range, consistent mapping) |
+| MAC addresses | `00:00:5E:00:53:xx` (IEEE documentation OUI, consistent mapping) |
+| MMS VisibleString identifiers (variable names, domain names, bilateral-table names) | `VAR_<hash>_____…` of identical length, deterministic by content |
+
+Well-known ICCP names (`TASE2_Version`, `Supported_Features`,
+`Bilateral_Table_ID`) are kept verbatim so the washed trace still
+reads as ICCP. Pass `--preserve-extra <name>` to whitelist additional
+strings.
+
+### What it does **not** change
+
+- TPKT / COTP / ISO Session / Presentation / ACSE framing
+- ASN.1 tags, CHOICE selectors, length fields
+- Presentation Context Identifier (so MMS still dispatches after washing)
+- Typed-data primitive values (floats, ints, bit-strings, binary-times) — these often carry operational state; keep or redact separately as appropriate.
+
+### Usage
+
+The script is pure Python 3 with no dependencies, legacy-pcap input only (pcapng needs a one-step `editcap -F pcap` first).
+
+```powershell
+# Windows
+editcap -F pcap real-capture.pcapng real-capture.pcap
+python3 scripts\wash-pcap.py real-capture.pcap safe-to-share.pcap
+```
+
+```bash
+# Linux / WSL
+editcap -F pcap real-capture.pcapng real-capture.pcap
+python3 scripts/wash-pcap.py real-capture.pcap safe-to-share.pcap
+```
+
+Smoke test: `bash tests/test-washer.sh` (validates on the bundled sample capture, 6 checks).
+
+**Do review the washed file before publishing.** The script catches
+the common cases but can miss vendor-specific extensions. If your
+capture has proprietary ASN.1 structures with non-VisibleString
+identifiers, extend the scrubber manually.
 
 ## Code-signing the Windows DLL (optional)
 
