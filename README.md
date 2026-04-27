@@ -27,6 +27,47 @@ existing MMS stack (TPKT → COTP → ISO 8327 Session → ISO 8823 Presentation
   associations that never see a TASE.2 reserved name stay in
   `Candidate` state and are not promoted
 
+## Features at a glance
+
+A condensed list of what plain MMS gives you vs what this plugin adds
+on top. The plugin enriches MMS — it does not replace it — so all
+MMS-level dissection still works underneath.
+
+| Area                          | Plain MMS shows                  | This plugin adds                                                                            |
+|-------------------------------|----------------------------------|---------------------------------------------------------------------------------------------|
+| **Protocol identification**   | `MMS` or `MMS/IEC61850`          | `ICCP` Protocol column, `iccp` display filter, association state machine                    |
+| **Naming conventions**        | raw `domainId.itemId` strings    | TASE.2 category (Bilateral Table, DSConditions, Device, Information_Message, …) + CB number |
+| **Name scope**                | `domain-specific` vs `vmd-specific` enum | `iccp.scope` field: `VCC` (public) vs `Bilateral` (peer-pair / Bilateral Table id)          |
+| **Association tracking**      | per-MMS-PDU only                 | per-conversation `Candidate → Confirmed → Closed` state across the whole flow              |
+| **Block 5 Device Control**    | raw `Device_*Select / Operate` writes | cross-conversation SBO state machine (Idle → Selected → Operated) with timeout enforcement  |
+| **SBO security**              | nothing                          | Expert-info on SBO violation (Operate without Select), Direct Operate, stale Select         |
+| **Floating-point values**     | `0800000000` (raw 5-byte hex)    | Inline IEEE-754 decode rendered next to the raw bytes (`Decoded float: 49.978`)             |
+| **Quality bytes**             | `bit-string: 80` (raw)           | Decoded TASE.2 IndicationPoint quality: Validity / Normal / TS_invalid / Source flags + summary |
+| **IndicationPoints**          | structure of (float, bit-string) | Synthesised `Point #N: <value> [VALID / CURRENT / NORMAL / TS_OK]` row per point            |
+| **Transfer Set reports**      | `success / failure` per item     | `iccp.report.*`: per-PDU points / success / failure / structured summary                    |
+| **Operation column**          | `unconfirmed-PDU informationReport` | `ICCP InformationReport`, `ICCP Read-Request [Bilateral Table: <name>]`, …                  |
+| **Statistics → ICCP**         | none                             | Operation, Object category, Conformance Block, Association state, Device sub-operation, Report outcomes, Points per Transfer Set, Point quality, Point value range, ICCP peers (src→dst), Operations by scope |
+| **External tap**              | none                             | `register_tap("iccp")` exposing per-packet ICCP attributes for Lua / custom listeners        |
+| **Display filters**           | `mms.*`                          | `iccp`, `iccp.point.value` (FT_FLOAT, graphable), `iccp.quality.validity`, `iccp.scope`, `iccp.domain`, `iccp.cb`, `iccp.device.state`, `iccp.object.category`, `iccp.report.*` |
+| **I/O graphs**                | not meaningful for MMS           | `AVG(iccp.point.value)` plots grid frequency / MW / setpoints directly from a capture       |
+| **PCAP scrubbing**            | not provided                     | `scripts/wash-pcap.py` SHA-256-hashes BER strings (and optionally numeric values) so a real utility capture can be shared without leaking site data |
+
+### Conformance-Block coverage
+
+| Block | Topic                                | This plugin |
+|-------|--------------------------------------|-------------|
+| 1     | Bilateral Table / version            | Recognised, Bilateral domain surfaced |
+| 2     | DSConditions / Transfer Sets         | Recognised, point synthesis + per-set stats |
+| 3     | Information Messages                 | Recognised by name pattern |
+| 4     | Program Control                      | Recognised by name pattern |
+| 5     | Device Control                       | Full SBO state machine + expert info |
+| 6     | Event Conditions                     | Recognised by name pattern |
+| 7     | Account tracking                     | Recognised by name pattern |
+| 8     | Time Series                          | Recognised by name pattern |
+| 9     | Additional / extended quality        | Recognised by name pattern |
+
+Phases 4-9 deeper decode (typed-data parsing per block) is on the roadmap; current Phase 1-3 deliverables cover the blocks utility operators run in production.
+
 ## Display filter fields
 
 | Filter                      | Type    | Description                                         |
@@ -38,6 +79,19 @@ existing MMS stack (TPKT → COTP → ISO 8327 Session → ISO 8823 Presentation
 | `iccp.object.category`      | string  | `Bilateral Table`, `Device SBO Operate`, …          |
 | `iccp.cb`                   | uint8   | Conformance Block number (1..9)                     |
 | `iccp.device.state`         | string  | `Idle` / `Selected` / `Operated`                    |
+| `iccp.scope`                | string  | `VCC` (public) or `Bilateral` (peer-pair scope)     |
+| `iccp.domain`               | string  | Bilateral Table id when scope=Bilateral             |
+| `iccp.point`                | string  | Synthesised `Point #N: <value> [quality]` row       |
+| `iccp.point.value`          | float   | Decoded numeric point value (graphable in I/O)      |
+| `iccp.point.quality`        | string  | Per-point quality summary                           |
+| `iccp.quality.validity`     | uint8   | 0=VALID, 1=HELD, 2=SUSPECT, 3=NOT_VALID             |
+| `iccp.quality.normal`       | bool    | Off-normal flag                                     |
+| `iccp.quality.ts_invalid`   | bool    | Timestamp invalid flag                              |
+| `iccp.quality.source`       | uint8   | 0=CURRENT, 1=HELD, 2=SUBSTITUTED, 3=GARBLED         |
+| `iccp.value.real`           | float   | Inline-decoded MMS floating-point primitive         |
+| `iccp.report.points`        | uint32  | Total AccessResult items in an InformationReport    |
+| `iccp.report.success`       | uint32  | Successful items                                    |
+| `iccp.report.failure`       | uint32  | Failed items                                        |
 
 Expert-info filters:
 

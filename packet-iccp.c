@@ -70,6 +70,8 @@ static int proto_iccp = -1;
 static int hf_iccp_association_state = -1;
 static int hf_iccp_object_category   = -1;
 static int hf_iccp_object_name       = -1;
+static int hf_iccp_scope             = -1;  /* "VCC" or "Bilateral" */
+static int hf_iccp_domain            = -1;  /* Bilateral Table id when scope=Bilateral */
 static int hf_iccp_operation         = -1;
 static int hf_iccp_conformance_block = -1;
 static int hf_iccp_device_state      = -1;
@@ -146,6 +148,7 @@ static int st_node_points_qual   = -1;  /* Tier 3: validity-class breakdown */
 static int st_node_points_range  = -1;  /* Tier 3: value range buckets */
 static int st_node_points_dist   = -1;  /* Tier 3: numeric value distribution (avg/min/max) */
 static int st_node_peers         = -1;  /* Tier 5: per src->dst peer pivot */
+static int st_node_scope         = -1;  /* TASE.2 name scope (VCC vs Bilateral) */
 
 /* Tap payload: everything a listener (stats_tree, custom Lua tap, an
  * external analysis) might reasonably want to know about a single ICCP
@@ -177,6 +180,8 @@ typedef struct {
      * codes seen in this PDU; the value range carries min/max/sum so
      * stats listeners can compute means without reparsing. */
     const char    *set_name;
+    const char    *scope;       /* "VCC" / "Bilateral" / NULL */
+    const char    *domain_id;   /* Bilateral Table id when scope=Bilateral */
     guint32        point_count;
     guint32        points_valid;
     guint32        points_held;
@@ -586,11 +591,37 @@ typedef struct {
     guint32  octet_string_count;
 } iccp_pdu_flags_t;
 
+/* TASE.2 name scope. A name in MMS lives either in the VMD's global
+ * namespace (TASE.2 calls this VCC scope -- "public" inside this
+ * control center) or inside a named domain (TASE.2 calls this
+ * Bilateral / ICC scope -- the domain is typically the Bilateral
+ * Table identifier the two peers agreed on). The scope distinction
+ * matters operationally: bilateral writes (especially Device_*) are
+ * the high-value targets; an unexpected VCC-scope access to a
+ * Bilateral object is itself an anomaly. */
+typedef enum {
+    ICCP_SCOPE_NONE = 0,
+    ICCP_SCOPE_VCC,
+    ICCP_SCOPE_BILATERAL
+} iccp_scope_t;
+
+static const char *
+iccp_scope_str(iccp_scope_t s)
+{
+    switch (s) {
+        case ICCP_SCOPE_VCC:       return "VCC";
+        case ICCP_SCOPE_BILATERAL: return "Bilateral";
+        default:                   return NULL;
+    }
+}
+
 typedef struct {
     const iccp_name_pattern_t *matched;
     const char                *matched_name;
     const char                *first_name;
     guint                      total;
+    iccp_scope_t               scope;
+    const char                *domain_id;   /* set when scope == BILATERAL */
 } iccp_name_scan_t;
 
 /* Classify a single identifier string; callback helper. */
@@ -675,6 +706,24 @@ walk_tree(packet_info *pinfo _U_, proto_tree *tree,
             if (fi->value) {
                 const char *sv = fvalue_get_string(fi->value);
                 iccp_consider_name(scan, sv);
+                /* Record name scope. mms.vmd_specific marks a VCC
+                 * name; mms.domainId marks the Bilateral / ICC
+                 * domain (the table both peers share); the itemId
+                 * inside lives in that domain. We set Bilateral on
+                 * either domainId or domainSpecific because the
+                 * MMS dissector emits one or the other depending on
+                 * which CHOICE alternative it took. Once Bilateral
+                 * is set we don't downgrade to VCC. */
+                if (!strcmp(s, "vmd_specific")) {
+                    if (scan->scope == ICCP_SCOPE_NONE)
+                        scan->scope = ICCP_SCOPE_VCC;
+                } else if (!strcmp(s, "domainId")) {
+                    scan->scope     = ICCP_SCOPE_BILATERAL;
+                    scan->domain_id = sv;
+                } else if (!strcmp(s, "domainSpecific")) {
+                    if (scan->scope == ICCP_SCOPE_NONE)
+                        scan->scope = ICCP_SCOPE_BILATERAL;
+                }
             }
         }
     }
@@ -1025,12 +1074,22 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
     if (!surface)
         return 0;
 
-    /* Protocol column. MMS / IEC61850 dissectors typically render
-     * "MMS/IEC61850" and may freeze the column with col_set_writable
-     * before returning, which silently no-ops our writes. Re-enable
-     * writes for both columns explicitly before we touch them. */
+    /* Re-enable writes (MMS / IEC61850 may have frozen them), clear
+     * any fence (a fence forces append instead of replace), then
+     * set the Protocol column. Wireshark's call_dissector dispatch
+     * for post-dissectors already adds "iccp" to pinfo->layers, so
+     * we don't push it ourselves. */
+    /* Re-enable writes; clear any fence on COL_PROTOCOL so we can
+     * replace "MMS/IEC61850" with "ICCP" rather than appending; do
+     * NOT clear COL_INFO -- MMS's info string ("InformationReport"
+     * etc.) is useful context, and we append onto it below.
+     * Clearing it loses MMS's text in the GUI even though our
+     * subsequent append never reaches the GUI's column cache. */
+    col_set_writable(pinfo->cinfo, -1,           TRUE);
     col_set_writable(pinfo->cinfo, COL_PROTOCOL, TRUE);
     col_set_writable(pinfo->cinfo, COL_INFO,     TRUE);
+    col_clear_fence(pinfo->cinfo, COL_PROTOCOL);
+    col_clear(pinfo->cinfo, COL_PROTOCOL);
     col_set_str(pinfo->cinfo, COL_PROTOCOL, "ICCP");
 
     /* Info column: <Op> on <Object>: <Name> */
@@ -1087,6 +1146,23 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
                                                 tvb, 0, 0, scan.matched->cb);
         proto_item_set_generated(cb_it);
         expert_add_info(pinfo, cit, &ei_iccp_object_seen);
+    }
+
+    /* Surface name scope (VCC vs Bilateral) regardless of whether
+     * we recognised the name pattern -- the scope is independent of
+     * pattern classification. */
+    {
+        const char *sc = iccp_scope_str(scan.scope);
+        if (sc) {
+            proto_item *sit = proto_tree_add_string(itree, hf_iccp_scope,
+                                                    tvb, 0, 0, sc);
+            proto_item_set_generated(sit);
+        }
+        if (scan.scope == ICCP_SCOPE_BILATERAL && scan.domain_id) {
+            proto_item *dit = proto_tree_add_string(itree, hf_iccp_domain,
+                                                    tvb, 0, 0, scan.domain_id);
+            proto_item_set_generated(dit);
+        }
     }
 
     if (op == ICCP_OP_ASSOC_REQ || op == ICCP_OP_ASSOC_RESP) {
@@ -1205,6 +1281,8 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
          * on heavily anonymised captures it's NULL and the tap
          * listener buckets under "(unnamed)". */
         ti2->set_name        = scan.matched_name;
+        ti2->scope           = iccp_scope_str(scan.scope);
+        ti2->domain_id       = scan.domain_id;
         ti2->point_count     = walk_ctx.point_index;
         ti2->points_valid    = walk_ctx.points_valid;
         ti2->points_held     = walk_ctx.points_held;
@@ -1218,7 +1296,15 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
         tap_queue_packet(proto_iccp_tap, pinfo, ti2);
     }
 
-    return 0;
+    /* Return captured length, not 0. A post-dissector that returns 0
+     * is treated as "didn't claim this packet" -- Wireshark then
+     * skips adding "iccp" to pinfo->layers, and the Protocol column
+     * is rendered from the layer chain's last entry ("mms"),
+     * silently overriding our col_set_str(COL_PROTOCOL,"ICCP"). The
+     * symptom in the GUI: every fix to columns and tap_listener
+     * flags appears to do nothing. Returning a non-zero value adds
+     * us to the chain so the column renders correctly. */
+    return tvb_captured_length(tvb);
 }
 
 /* -------------------------------------------------------------------------
@@ -1248,6 +1334,11 @@ iccp_stats_tree_init(stats_tree *st)
      * a lightweight ICCP conversation table without the weight of
      * register_conversation_table(). */
     st_node_peers        = stats_tree_create_node(st, "ICCP peers",              0, STAT_DT_INT, TRUE);
+    /* TASE.2 name scope: VCC = VMD-global / "public" inside this
+     * control center; Bilateral = scoped to a Bilateral Table /
+     * peer-pair. Bilateral writes (especially Device_*) are the
+     * security-sensitive operations. */
+    st_node_scope        = stats_tree_create_node(st, "Operations by scope",     0, STAT_DT_INT, TRUE);
 }
 
 static tap_packet_status
@@ -1346,6 +1437,15 @@ iccp_stats_tree_packet(stats_tree *st,
         wmem_free(NULL, dst);
     }
 
+    /* Name scope: VCC vs Bilateral. Bilateral PDUs typically carry
+     * the high-value reads/writes; the per-domain pivot under
+     * "Bilateral" lets you see at a glance which Bilateral Tables
+     * are seeing the most traffic. */
+    if (ti->scope) {
+        tick_stat_node(st, "Operations by scope", 0, TRUE);
+        tick_stat_node(st, ti->scope, st_node_scope, FALSE);
+    }
+
     return TAP_PACKET_REDRAW;
 }
 
@@ -1373,6 +1473,21 @@ proto_register_iccp(void)
           { "Object name", "iccp.object.name",
             FT_STRING, BASE_NONE, NULL, 0x0,
             "The MMS identifier that matched an ICCP naming convention",
+            HFILL }
+        },
+        { &hf_iccp_scope,
+          { "Scope", "iccp.scope",
+            FT_STRING, BASE_NONE, NULL, 0x0,
+            "TASE.2 name scope: VCC = VMD-global (public to this control "
+            "center) or Bilateral = scoped to a named domain (the Bilateral "
+            "Table both peers share -- typically the high-value access path).",
+            HFILL }
+        },
+        { &hf_iccp_domain,
+          { "Bilateral domain", "iccp.domain",
+            FT_STRING, BASE_NONE, NULL, 0x0,
+            "MMS domainId of the Bilateral Table the access is scoped to. "
+            "Empty when scope is VCC.",
             HFILL }
         },
         { &hf_iccp_operation,
