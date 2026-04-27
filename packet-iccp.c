@@ -144,6 +144,7 @@ static int st_node_reports    = -1;
 static int st_node_points_set    = -1;  /* Tier 3: pivot per Transfer-Set */
 static int st_node_points_qual   = -1;  /* Tier 3: validity-class breakdown */
 static int st_node_points_range  = -1;  /* Tier 3: value range buckets */
+static int st_node_points_dist   = -1;  /* Tier 3: numeric value distribution (avg/min/max) */
 static int st_node_peers         = -1;  /* Tier 5: per src->dst peer pivot */
 
 /* Tap payload: everything a listener (stats_tree, custom Lua tap, an
@@ -1024,7 +1025,12 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
     if (!surface)
         return 0;
 
-    /* Protocol column. */
+    /* Protocol column. MMS / IEC61850 dissectors typically render
+     * "MMS/IEC61850" and may freeze the column with col_set_writable
+     * before returning, which silently no-ops our writes. Re-enable
+     * writes for both columns explicitly before we touch them. */
+    col_set_writable(pinfo->cinfo, COL_PROTOCOL, TRUE);
+    col_set_writable(pinfo->cinfo, COL_INFO,     TRUE);
     col_set_str(pinfo->cinfo, COL_PROTOCOL, "ICCP");
 
     /* Info column: <Op> on <Object>: <Name> */
@@ -1569,6 +1575,15 @@ proto_register_iccp(void)
                                NULL);
 }
 
+/* No-op tap callback: just exists to carry TL_REQUIRES_PROTO_TREE. */
+static tap_packet_status
+iccp_force_tree_packet(void *tapdata _U_, packet_info *pinfo _U_,
+                       epan_dissect_t *edt _U_, const void *p _U_,
+                       tap_flags_t flags _U_)
+{
+    return TAP_PACKET_DONT_REDRAW;
+}
+
 void
 proto_reg_handoff_iccp(void)
 {
@@ -1639,4 +1654,36 @@ proto_reg_handoff_iccp(void)
         }
     }
     set_postdissector_wanted_hfids(iccp_handle, wanted);
+
+    /* Force a full proto tree on every packet, every pass.
+     *
+     * Without this, Wireshark's GUI does a "column-only" first pass
+     * that tags each frame with its protocol but doesn't build the
+     * full proto tree -- it only builds the tree on demand when the
+     * user clicks a frame, or when a tap listener requires it. Our
+     * post-dissector reads MMS field_info entries to derive iccp.*
+     * items, so without a tree it has nothing to scrape, and the
+     * file-wide `iccp` filter matches zero frames even though every
+     * clicked-on packet shows the ICCP subtree fine.
+     *
+     * set_postdissector_wanted_hfids() above is supposed to handle
+     * this, but in practice the GUI still skips the tree on
+     * non-displayed frames. The bulletproof fix is to register an
+     * always-on tap listener that requires PROTO_TREE -- its
+     * presence makes Wireshark build the tree unconditionally for
+     * every packet, every session, including on fresh file open
+     * before the user touches anything. The "frame" tap fires once
+     * per packet so it's the cheapest hook; the listener itself
+     * does nothing. */
+    GString *err = register_tap_listener("frame", NULL, NULL,
+                                         TL_REQUIRES_PROTO_TREE,
+                                         NULL, iccp_force_tree_packet,
+                                         NULL, 0);
+    if (err) {
+        /* Tap "frame" should always be present in stock Wireshark;
+         * if registration ever fails we silently fall back to the
+         * wanted-hfids-only behaviour (works in tshark, partial in
+         * GUI). */
+        g_string_free(err, TRUE);
+    }
 }
