@@ -92,6 +92,7 @@ static int hf_iccp_value_real        = -1;
 static gint ett_iccp         = -1;
 static gint ett_iccp_objects = -1;
 static gint ett_iccp_device  = -1;
+static gint ett_iccp_value   = -1;
 
 static expert_field ei_iccp_association_seen   = EI_INIT;
 static expert_field ei_iccp_object_seen        = EI_INIT;
@@ -491,12 +492,6 @@ typedef struct {
     guint32  binary_time_count;
     guint32  visible_string_count;
     guint32  octet_string_count;
-    /* Decoded mms.floating_point primitives, in tree-walk order.
-     * Allocated from pinfo->pool when needed. NULL if the packet
-     * contains no floats. */
-    gfloat  *floats;
-    guint32  floats_count;
-    guint32  floats_capacity;
 } iccp_pdu_flags_t;
 
 typedef struct {
@@ -532,7 +527,7 @@ iccp_consider_name(iccp_name_scan_t *s, const char *name)
  * cached id misses the other use site entirely. strcmp-by-abbrev sees
  * both. */
 static void
-walk_tree(packet_info *pinfo, proto_tree *tree,
+walk_tree(packet_info *pinfo _U_, proto_tree *tree,
           iccp_pdu_flags_t *flags, iccp_name_scan_t *scan)
 {
     memset(flags, 0, sizeof *flags);
@@ -574,29 +569,7 @@ walk_tree(packet_info *pinfo, proto_tree *tree,
          * total AccessResult items minus failure count. */
         else if (!strcmp(s, "failure"))             flags->failure_count++;
         else if (!strcmp(s, "structure_element"))   flags->structure_count++;
-        else if (!strcmp(s, "floating_point")) {
-            flags->floating_point_count++;
-            /* MMS Data.floating-point is encoded as 1-byte exponent
-             * width + N-byte IEEE 754 number, big-endian. The
-             * canonical TASE.2 case is exponent-width=8 with a
-             * 32-bit single-precision mantissa, total 5 bytes. */
-            if (fi->ds_tvb && fi->length >= 5) {
-                guint8 exp_w = tvb_get_guint8(fi->ds_tvb, fi->start);
-                if (exp_w == 8) {
-                    gfloat val = tvb_get_ntohieee_float(fi->ds_tvb,
-                                                       fi->start + 1);
-                    if (flags->floats_count >= flags->floats_capacity) {
-                        guint32 newcap = flags->floats_capacity
-                                        ? flags->floats_capacity * 2 : 16;
-                        flags->floats = (gfloat *)wmem_realloc(
-                            pinfo->pool, flags->floats,
-                            newcap * sizeof(gfloat));
-                        flags->floats_capacity = newcap;
-                    }
-                    flags->floats[flags->floats_count++] = val;
-                }
-            }
-        }
+        else if (!strcmp(s, "floating_point"))      flags->floating_point_count++;
         else if (!strcmp(s, "data_bit-string"))     flags->bit_string_count++;
         else if (!strcmp(s, "data.binary-time"))    flags->binary_time_count++;
         else if (!strcmp(s, "data.visible-string")) flags->visible_string_count++;
@@ -650,6 +623,39 @@ classify_operation(const iccp_pdu_flags_t *f)
     return ICCP_OP_NONE;
 }
 
+/* Recursive walker that attaches one generated child item under
+ * every mms.floating_point proto-node it finds, decoding the bytes
+ * to a real number (1-byte exponent-width prefix + IEEE 754 BE
+ * mantissa, the canonical TASE.2 encoding). The decoded value
+ * appears in the tree right next to the raw hex MMS shows, so the
+ * reader doesn't have to scroll to the iccp subtree to get it. */
+static void
+attach_decoded_floats(proto_node *node, gpointer user_data _U_)
+{
+    if (!node) return;
+    field_info *fi = PNODE_FINFO(node);
+    if (fi && fi->hfinfo && fi->hfinfo->abbrev
+        && strcmp(fi->hfinfo->abbrev, "mms.floating_point") == 0
+        && fi->ds_tvb && fi->length >= 5) {
+        guint8 exp_w = tvb_get_guint8(fi->ds_tvb, fi->start);
+        if (exp_w == 8) {
+            gfloat val = tvb_get_ntohieee_float(fi->ds_tvb,
+                                                fi->start + 1);
+            /* node is a primitive leaf -- promote it to a subtree
+             * so we can add a child item under it. */
+            proto_tree *sub = proto_item_add_subtree(node, ett_iccp_value);
+            proto_item *it = proto_tree_add_float(sub,
+                                                  hf_iccp_value_real,
+                                                  fi->ds_tvb,
+                                                  fi->start,
+                                                  fi->length, val);
+            proto_item_set_generated(it);
+        }
+    }
+    /* Recurse into children. */
+    proto_tree_children_foreach(node, attach_decoded_floats, NULL);
+}
+
 static int
 dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
 {
@@ -661,6 +667,15 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
     iccp_pdu_flags_t flags;
     iccp_name_scan_t scan;
     walk_tree(pinfo, tree, &flags, &scan);
+
+    /* Attach decoded float values inline next to each mms.floating_point
+     * leaf in the tree, regardless of whether the packet otherwise
+     * surfaces as ICCP. This makes the decoded value visible in the
+     * GUI right where the user is already looking at the raw bytes,
+     * instead of forcing them to scroll into the iccp subtree. */
+    if (flags.floating_point_count > 0) {
+        proto_tree_children_foreach(tree, attach_decoded_floats, NULL);
+    }
 
     iccp_op_t op = classify_operation(&flags);
 
@@ -848,19 +863,6 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
         proto_item *sumit = proto_tree_add_string(itree, hf_iccp_report_summary,
                                                   tvb, 0, 0, summary);
         proto_item_set_generated(sumit);
-
-        /* Emit one iccp.value.real generated item per decoded float.
-         * They appear in tree-walk order, which matches the order of
-         * AccessResults in the InformationReport, so a user can
-         * correlate values position-by-position with the report's
-         * point list. */
-        for (guint32 k = 0; k < flags.floats_count; k++) {
-            proto_item *vit = proto_tree_add_float(itree,
-                                                   hf_iccp_value_real,
-                                                   tvb, 0, 0,
-                                                   flags.floats[k]);
-            proto_item_set_generated(vit);
-        }
     }
 
     /* Device sub-tree. */
@@ -1097,6 +1099,7 @@ proto_register_iccp(void)
         &ett_iccp,
         &ett_iccp_objects,
         &ett_iccp_device,
+        &ett_iccp_value,
     };
 
     static ei_register_info ei[] = {
