@@ -83,6 +83,12 @@ static int hf_iccp_report_failure    = -1;
 static int hf_iccp_report_structured = -1;
 static int hf_iccp_report_summary    = -1;
 
+/* MMS floating-point primitive decoded to a real number. Wireshark's
+ * MMS dissector renders these as raw bytes (e.g. "08be81a9a0") because
+ * the 1-byte-exponent-width prefix is non-standard outside MMS. We
+ * decode them here. */
+static int hf_iccp_value_real        = -1;
+
 static gint ett_iccp         = -1;
 static gint ett_iccp_objects = -1;
 static gint ett_iccp_device  = -1;
@@ -485,6 +491,12 @@ typedef struct {
     guint32  binary_time_count;
     guint32  visible_string_count;
     guint32  octet_string_count;
+    /* Decoded mms.floating_point primitives, in tree-walk order.
+     * Allocated from pinfo->pool when needed. NULL if the packet
+     * contains no floats. */
+    gfloat  *floats;
+    guint32  floats_count;
+    guint32  floats_capacity;
 } iccp_pdu_flags_t;
 
 typedef struct {
@@ -520,7 +532,8 @@ iccp_consider_name(iccp_name_scan_t *s, const char *name)
  * cached id misses the other use site entirely. strcmp-by-abbrev sees
  * both. */
 static void
-walk_tree(proto_tree *tree, iccp_pdu_flags_t *flags, iccp_name_scan_t *scan)
+walk_tree(packet_info *pinfo, proto_tree *tree,
+          iccp_pdu_flags_t *flags, iccp_name_scan_t *scan)
 {
     memset(flags, 0, sizeof *flags);
     memset(scan,  0, sizeof *scan);
@@ -561,7 +574,29 @@ walk_tree(proto_tree *tree, iccp_pdu_flags_t *flags, iccp_name_scan_t *scan)
          * total AccessResult items minus failure count. */
         else if (!strcmp(s, "failure"))             flags->failure_count++;
         else if (!strcmp(s, "structure_element"))   flags->structure_count++;
-        else if (!strcmp(s, "floating_point"))      flags->floating_point_count++;
+        else if (!strcmp(s, "floating_point")) {
+            flags->floating_point_count++;
+            /* MMS Data.floating-point is encoded as 1-byte exponent
+             * width + N-byte IEEE 754 number, big-endian. The
+             * canonical TASE.2 case is exponent-width=8 with a
+             * 32-bit single-precision mantissa, total 5 bytes. */
+            if (fi->ds_tvb && fi->length >= 5) {
+                guint8 exp_w = tvb_get_guint8(fi->ds_tvb, fi->start);
+                if (exp_w == 8) {
+                    gfloat val = tvb_get_ntohieee_float(fi->ds_tvb,
+                                                       fi->start + 1);
+                    if (flags->floats_count >= flags->floats_capacity) {
+                        guint32 newcap = flags->floats_capacity
+                                        ? flags->floats_capacity * 2 : 16;
+                        flags->floats = (gfloat *)wmem_realloc(
+                            pinfo->pool, flags->floats,
+                            newcap * sizeof(gfloat));
+                        flags->floats_capacity = newcap;
+                    }
+                    flags->floats[flags->floats_count++] = val;
+                }
+            }
+        }
         else if (!strcmp(s, "data_bit-string"))     flags->bit_string_count++;
         else if (!strcmp(s, "data.binary-time"))    flags->binary_time_count++;
         else if (!strcmp(s, "data.visible-string")) flags->visible_string_count++;
@@ -625,7 +660,7 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
 
     iccp_pdu_flags_t flags;
     iccp_name_scan_t scan;
-    walk_tree(tree, &flags, &scan);
+    walk_tree(pinfo, tree, &flags, &scan);
 
     iccp_op_t op = classify_operation(&flags);
 
@@ -683,13 +718,23 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
         }
     }
 
-    /* Decide whether this packet is worth surfacing as ICCP. */
+    /* Decide whether this packet is worth surfacing as ICCP. We
+     * surface unconditionally on InformationReport / Read-Response
+     * because those carry typed-data values (floats, bit-strings,
+     * timestamps) we want to decode -- this works even on
+     * heavily-anonymized captures where the variable names have
+     * been hashed and our TASE.2 name-match heuristic cannot run.
+     * For plain IEC 61850 MMS the iccp.* fields will be sparse but
+     * the decoded float values are still useful. */
     gboolean surface =
         info->state == ICCP_ASSOC_CONFIRMED
         || op == ICCP_OP_ASSOC_REQ
         || op == ICCP_OP_ASSOC_RESP
         || op == ICCP_OP_CONCLUDE_REQ
         || op == ICCP_OP_CONCLUDE_RESP
+        || op == ICCP_OP_INFORMATION_REPORT
+        || op == ICCP_OP_READ_RESP
+        || op == ICCP_OP_WRITE_RESP
         || scan.matched != NULL;
 
     if (!surface)
@@ -803,6 +848,19 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
         proto_item *sumit = proto_tree_add_string(itree, hf_iccp_report_summary,
                                                   tvb, 0, 0, summary);
         proto_item_set_generated(sumit);
+
+        /* Emit one iccp.value.real generated item per decoded float.
+         * They appear in tree-walk order, which matches the order of
+         * AccessResults in the InformationReport, so a user can
+         * correlate values position-by-position with the report's
+         * point list. */
+        for (guint32 k = 0; k < flags.floats_count; k++) {
+            proto_item *vit = proto_tree_add_float(itree,
+                                                   hf_iccp_value_real,
+                                                   tvb, 0, 0,
+                                                   flags.floats[k]);
+            proto_item_set_generated(vit);
+        }
     }
 
     /* Device sub-tree. */
@@ -1022,6 +1080,15 @@ proto_register_iccp(void)
             FT_STRING, BASE_NONE, NULL, 0x0,
             "Human-readable breakdown of primitive data values present "
             "in the report (floats, bit-strings, binary-times, ...)",
+            HFILL }
+        },
+        { &hf_iccp_value_real,
+          { "Decoded float", "iccp.value.real",
+            FT_FLOAT, BASE_NONE, NULL, 0x0,
+            "MMS floating-point primitive decoded to IEEE 754 single-"
+            "precision. The MMS dissector shows these as raw bytes "
+            "because the 1-byte exponent-width prefix is unusual; this "
+            "field exposes the actual numeric value.",
             HFILL }
         },
     };

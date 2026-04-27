@@ -66,7 +66,21 @@ Write-Host ""
 Write-Host "=== produced $dll ($len bytes) ==="
 
 if (-not $NoInstall) {
-    $userPluginDir = "$env:APPDATA\Wireshark\plugins\4.2\epan"
+    # Wireshark plugins live under %APPDATA%\Wireshark\plugins\<X.Y>\epan\
+    # where <X.Y> is the major.minor version of the runtime. We derive
+    # it from the WiresharkConfigVersion.cmake in the install tree
+    # rather than hard-coding it -- otherwise we install a 4.6-built
+    # plugin into the 4.2 plugin dir and the 4.6 runtime ignores it.
+    $cfgVer = Join-Path $WiresharkInstall 'cmake\WiresharkConfigVersion.cmake'
+    $verLine = (Get-Content $cfgVer -ErrorAction SilentlyContinue |
+                Select-String 'PACKAGE_VERSION\s+"\d+\.\d+').Matches.Value
+    if ($verLine -match '"(\d+\.\d+)') {
+        $minor = $Matches[1]
+    } else {
+        Write-Warning "could not infer Wireshark minor from $cfgVer; defaulting to 4.2"
+        $minor = '4.2'
+    }
+    $userPluginDir = "$env:APPDATA\Wireshark\plugins\$minor\epan"
     New-Item -ItemType Directory -Path $userPluginDir -Force | Out-Null
     Copy-Item $dll -Destination $userPluginDir -Force
     Write-Host "installed to $userPluginDir\iccp.dll"
