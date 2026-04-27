@@ -89,10 +89,40 @@ static int hf_iccp_report_summary    = -1;
  * decode them here. */
 static int hf_iccp_value_real        = -1;
 
+/* TASE.2 IndicationPoint quality (per IEC 60870-6-503). Encoded as a
+ * 1-byte BIT STRING in MMS:
+ *   bits 7-6  validity         00=VALID  01=HELD  10=SUSPECT  11=NOT_VALID
+ *   bit  5    normal           0=NORMAL  1=OFF_NORMAL
+ *   bit  4    timestamp_qual   0=VALID   1=INVALID
+ *   bits 3-2  current_source   00=CURRENT 01=HELD 10=SUBSTITUTED 11=GARBLED
+ *   bits 1-0  reserved
+ * Each subfield is exposed as its own filterable hf so users can
+ * graph or filter individual flags; iccp.quality is the raw byte for
+ * the bitmask child rendering, iccp.quality.summary is a one-line
+ * human-friendly digest like "VALID/CURRENT/NORMAL/TS_OK". */
+static int hf_iccp_quality           = -1;
+static int hf_iccp_quality_validity  = -1;
+static int hf_iccp_quality_normal    = -1;
+static int hf_iccp_quality_ts_invalid = -1;
+static int hf_iccp_quality_source    = -1;
+static int hf_iccp_quality_summary   = -1;
+
+/* Combined-point row: a TASE.2 IndicationPoint typically materialises
+ * as a structure of (floating-point, bit-string) -- value plus
+ * quality. We synthesise an "iccp.point" item that puts both on a
+ * single line so a 250-point report becomes 250 readable rows
+ * instead of 1000 raw-hex sub-leaves. */
+static int hf_iccp_point_summary     = -1;
+static int hf_iccp_point_value       = -1;
+static int hf_iccp_point_quality     = -1;
+static int hf_iccp_point_index       = -1;
+
 static gint ett_iccp         = -1;
 static gint ett_iccp_objects = -1;
 static gint ett_iccp_device  = -1;
 static gint ett_iccp_value   = -1;
+static gint ett_iccp_quality = -1;
+static gint ett_iccp_point   = -1;
 
 static expert_field ei_iccp_association_seen   = EI_INIT;
 static expert_field ei_iccp_object_seen        = EI_INIT;
@@ -148,6 +178,44 @@ typedef struct {
  * case-sensitive substring; the first match wins (order matters --
  * more specific patterns come first).
  * ---------------------------------------------------------------------- */
+
+/* IEC 60870-6-503 TASE.2 IndicationPoint quality flag bit definitions. */
+#define ICCP_Q_VALIDITY_MASK    0xC0
+#define ICCP_Q_NORMAL_MASK      0x20
+#define ICCP_Q_TS_INVALID_MASK  0x10
+#define ICCP_Q_SOURCE_MASK      0x0C
+
+static const value_string iccp_q_validity_vals[] = {
+    { 0, "VALID" },
+    { 1, "HELD" },
+    { 2, "SUSPECT" },
+    { 3, "NOT_VALID" },
+    { 0, NULL }
+};
+
+static const value_string iccp_q_source_vals[] = {
+    { 0, "CURRENT" },
+    { 1, "HELD" },
+    { 2, "SUBSTITUTED" },
+    { 3, "GARBLED" },
+    { 0, NULL }
+};
+
+/* Build a one-line "VALID/CURRENT/NORMAL/TS_OK" summary out of a
+ * raw quality byte. Returns a static-buffered string (caller should
+ * not retain across calls). */
+static const char *
+iccp_quality_summary(char *buf, size_t buflen, guint8 q)
+{
+    const char *valid  = val_to_str_const((q & ICCP_Q_VALIDITY_MASK) >> 6,
+                                          iccp_q_validity_vals, "?");
+    const char *source = val_to_str_const((q & ICCP_Q_SOURCE_MASK)   >> 2,
+                                          iccp_q_source_vals,   "?");
+    const char *normal = (q & ICCP_Q_NORMAL_MASK)     ? "OFF_NORMAL" : "NORMAL";
+    const char *tsq    = (q & ICCP_Q_TS_INVALID_MASK) ? "TS_INVALID" : "TS_OK";
+    g_snprintf(buf, buflen, "%s / %s / %s / %s", valid, source, normal, tsq);
+    return buf;
+}
 
 typedef struct {
     const char *token;
@@ -623,37 +691,185 @@ classify_operation(const iccp_pdu_flags_t *f)
     return ICCP_OP_NONE;
 }
 
-/* Recursive walker that attaches one generated child item under
- * every mms.floating_point proto-node it finds, decoding the bytes
- * to a real number (1-byte exponent-width prefix + IEEE 754 BE
- * mantissa, the canonical TASE.2 encoding). The decoded value
- * appears in the tree right next to the raw hex MMS shows, so the
- * reader doesn't have to scroll to the iccp subtree to get it. */
+/* Per-walk context so we can number points and emit aggregate stats. */
+typedef struct {
+    guint32 point_index;   /* incremented as we synthesise iccp.point rows */
+} iccp_walk_ctx_t;
+
+static void attach_decoded_values(proto_node *node, gpointer user_data);
+
+/* If `node` is an mms.structure_element with two primitive children
+ * matching the canonical TASE.2 IndicationPoint shape (floating_point
+ * + bit-string), synthesise a single iccp.point row that puts the
+ * decoded value and quality on one line. */
 static void
-attach_decoded_floats(proto_node *node, gpointer user_data _U_)
+maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
 {
-    if (!node) return;
     field_info *fi = PNODE_FINFO(node);
-    if (fi && fi->hfinfo && fi->hfinfo->abbrev
-        && strcmp(fi->hfinfo->abbrev, "mms.floating_point") == 0
-        && fi->ds_tvb && fi->length >= 5) {
-        guint8 exp_w = tvb_get_guint8(fi->ds_tvb, fi->start);
-        if (exp_w == 8) {
-            gfloat val = tvb_get_ntohieee_float(fi->ds_tvb,
-                                                fi->start + 1);
-            /* node is a primitive leaf -- promote it to a subtree
-             * so we can add a child item under it. */
-            proto_tree *sub = proto_item_add_subtree(node, ett_iccp_value);
-            proto_item *it = proto_tree_add_float(sub,
-                                                  hf_iccp_value_real,
-                                                  fi->ds_tvb,
-                                                  fi->start,
-                                                  fi->length, val);
-            proto_item_set_generated(it);
+    if (!fi || !fi->hfinfo || !fi->hfinfo->abbrev) return;
+    /* The innermost SEQUENCE wrapper for an MMS Data.structure carries
+     * different abbrevs across Wireshark versions:
+     *   4.2 uses "mms.structure_element" (FT_NONE element wrapper)
+     *   4.6 uses "mms.structure"         (FT_UINT32 CHOICE selector)
+     * We accept either. Only one will exist in any given runtime so
+     * there's no double-emission risk. */
+    const char *a = fi->hfinfo->abbrev;
+    if (strcmp(a, "mms.structure_element") != 0
+     && strcmp(a, "mms.structure")         != 0) {
+        return;
+    }
+
+    /* Walk the entire subtree under `node`, collecting any
+     * floating_point and data_bit-string leaves. We don't insist on
+     * a specific intermediate path because the MMS dissector wraps
+     * primitives in either mms.Data (CHOICE selector) or
+     * mms.data_element (FT_NONE element wrapper) depending on the
+     * dissector version. As long as the structure has exactly one
+     * float and one bit-string, treat it as an IndicationPoint. */
+    proto_node *fp_node = NULL;
+    proto_node *bs_node = NULL;
+    int floats = 0, bitstrings = 0;
+    /* Bounded depth-first walk over node's descendants. */
+    typedef struct stk_s { proto_node *p; struct stk_s *next; } stk_t;
+    stk_t *stack = NULL;
+    for (proto_node *c = node->first_child; c; c = c->next) {
+        stk_t *s = (stk_t *)g_alloca(sizeof(stk_t));
+        s->p = c; s->next = stack; stack = s;
+    }
+    while (stack) {
+        proto_node *cur = stack->p;
+        stack = stack->next;
+        field_info *cfi = PNODE_FINFO(cur);
+        if (cfi && cfi->hfinfo && cfi->hfinfo->abbrev) {
+            const char *a = cfi->hfinfo->abbrev;
+            if (strcmp(a, "mms.floating_point") == 0) {
+                fp_node = cur; floats++;
+            } else if (strcmp(a, "mms.data_bit-string") == 0) {
+                bs_node = cur; bitstrings++;
+            }
+        }
+        for (proto_node *cc = cur->first_child; cc; cc = cc->next) {
+            stk_t *s = (stk_t *)g_alloca(sizeof(stk_t));
+            s->p = cc; s->next = stack; stack = s;
         }
     }
-    /* Recurse into children. */
-    proto_tree_children_foreach(node, attach_decoded_floats, NULL);
+    if (floats != 1 || bitstrings != 1 || !fp_node || !bs_node) return;
+
+    field_info *fp_fi = PNODE_FINFO(fp_node);
+    field_info *bs_fi = PNODE_FINFO(bs_node);
+    if (!fp_fi || fp_fi->length < 5 || !fp_fi->ds_tvb) return;
+    if (!bs_fi || bs_fi->length < 1 || !bs_fi->ds_tvb) return;
+    if (tvb_get_guint8(fp_fi->ds_tvb, fp_fi->start) != 8) return;
+
+    gfloat  v = tvb_get_ntohieee_float(fp_fi->ds_tvb, fp_fi->start + 1);
+    guint8  q = tvb_get_guint8(bs_fi->ds_tvb, bs_fi->start);
+
+    char qbuf[64];
+    iccp_quality_summary(qbuf, sizeof qbuf, q);
+
+    char line[160];
+    g_snprintf(line, sizeof line, "Point #%u: %.6g  [%s]",
+               ctx->point_index, v, qbuf);
+    ctx->point_index++;
+
+    /* Promote the structure_element to a subtree (it usually already
+     * is one, but proto_item_add_subtree is idempotent for our
+     * ett_iccp_point on a fresh node) and add the synthesis row. */
+    proto_tree *sub = proto_item_add_subtree(node, ett_iccp_point);
+    proto_item *pit = proto_tree_add_string(sub, hf_iccp_point_summary,
+                                            fp_fi->ds_tvb,
+                                            fp_fi->start,
+                                            (bs_fi->start + bs_fi->length)
+                                              - fp_fi->start,
+                                            line);
+    proto_item_set_generated(pit);
+    proto_tree *psub = proto_item_add_subtree(pit, ett_iccp_point);
+    proto_item *vi = proto_tree_add_float(psub, hf_iccp_point_value,
+                                          fp_fi->ds_tvb, fp_fi->start,
+                                          fp_fi->length, v);
+    proto_item_set_generated(vi);
+    proto_item *qi = proto_tree_add_string(psub, hf_iccp_point_quality,
+                                           bs_fi->ds_tvb, bs_fi->start,
+                                           bs_fi->length, qbuf);
+    proto_item_set_generated(qi);
+    proto_item *ii = proto_tree_add_uint(psub, hf_iccp_point_index,
+                                         fp_fi->ds_tvb, fp_fi->start, 0,
+                                         ctx->point_index - 1);
+    proto_item_set_generated(ii);
+}
+
+/* If `node` is an mms.data_bit-string of length 1, treat it as a
+ * TASE.2 IndicationPoint quality byte and decode each flag bit as
+ * a child item. */
+static void
+maybe_decode_quality(proto_node *node)
+{
+    field_info *fi = PNODE_FINFO(node);
+    if (!fi || !fi->hfinfo || !fi->hfinfo->abbrev) return;
+    if (strcmp(fi->hfinfo->abbrev, "mms.data_bit-string") != 0) return;
+    if (fi->length != 1 || !fi->ds_tvb) return;
+
+    guint8 q = tvb_get_guint8(fi->ds_tvb, fi->start);
+    char buf[64];
+    iccp_quality_summary(buf, sizeof buf, q);
+
+    proto_tree *sub = proto_item_add_subtree(node, ett_iccp_quality);
+    proto_item *summary_it = proto_tree_add_string(sub, hf_iccp_quality_summary,
+                                                   fi->ds_tvb, fi->start,
+                                                   fi->length, buf);
+    proto_item_set_generated(summary_it);
+    /* Hidden parent uint8 carries the bitmask; children render the
+     * individual fields via the registered masks. */
+    proto_item *q_item = proto_tree_add_uint(sub, hf_iccp_quality,
+                                             fi->ds_tvb, fi->start, 1, q);
+    proto_item_set_generated(q_item);
+    proto_tree *qsub = proto_item_add_subtree(q_item, ett_iccp_quality);
+    proto_tree_add_item(qsub, hf_iccp_quality_validity,
+                        fi->ds_tvb, fi->start, 1, ENC_BIG_ENDIAN);
+    proto_tree_add_item(qsub, hf_iccp_quality_normal,
+                        fi->ds_tvb, fi->start, 1, ENC_BIG_ENDIAN);
+    proto_tree_add_item(qsub, hf_iccp_quality_ts_invalid,
+                        fi->ds_tvb, fi->start, 1, ENC_BIG_ENDIAN);
+    proto_tree_add_item(qsub, hf_iccp_quality_source,
+                        fi->ds_tvb, fi->start, 1, ENC_BIG_ENDIAN);
+}
+
+/* Decode a 5-byte mms.floating_point as a real number and add it
+ * as a generated child of the leaf. */
+static void
+maybe_decode_float(proto_node *node)
+{
+    field_info *fi = PNODE_FINFO(node);
+    if (!fi || !fi->hfinfo || !fi->hfinfo->abbrev) return;
+    if (strcmp(fi->hfinfo->abbrev, "mms.floating_point") != 0) return;
+    if (fi->length < 5 || !fi->ds_tvb) return;
+    if (tvb_get_guint8(fi->ds_tvb, fi->start) != 8) return;
+
+    gfloat val = tvb_get_ntohieee_float(fi->ds_tvb, fi->start + 1);
+    proto_tree *sub = proto_item_add_subtree(node, ett_iccp_value);
+    proto_item *it = proto_tree_add_float(sub, hf_iccp_value_real,
+                                          fi->ds_tvb, fi->start,
+                                          fi->length, val);
+    proto_item_set_generated(it);
+}
+
+/* Recursive tree-walker that runs three passes per node:
+ *   1. decode mms.floating_point bytes as a real number
+ *   2. decode mms.data_bit-string of length 1 as quality flags
+ *   3. detect (floating_point, bit-string) pairs inside a structure
+ *      and synthesise a single-line "Point #N: V [quality]" row
+ * then descends into children. */
+static void
+attach_decoded_values(proto_node *node, gpointer user_data)
+{
+    if (!node) return;
+    iccp_walk_ctx_t *ctx = (iccp_walk_ctx_t *)user_data;
+
+    maybe_decode_float(node);
+    maybe_decode_quality(node);
+    if (ctx) maybe_synthesise_point(node, ctx);
+
+    proto_tree_children_foreach(node, attach_decoded_values, ctx);
 }
 
 static int
@@ -668,13 +884,20 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
     iccp_name_scan_t scan;
     walk_tree(pinfo, tree, &flags, &scan);
 
-    /* Attach decoded float values inline next to each mms.floating_point
-     * leaf in the tree, regardless of whether the packet otherwise
-     * surfaces as ICCP. This makes the decoded value visible in the
-     * GUI right where the user is already looking at the raw bytes,
-     * instead of forcing them to scroll into the iccp subtree. */
-    if (flags.floating_point_count > 0) {
-        proto_tree_children_foreach(tree, attach_decoded_floats, NULL);
+    /* Attach inline decoded values for any MMS leaf we can interpret:
+     *  - floating_point bytes -> real number under the leaf
+     *  - 1-byte bit-string    -> TASE.2 quality flags decoded
+     *  - (float, bit-string) sibling pair inside a structure ->
+     *    synthesised "Point #N: <value> [quality]" row at the
+     *    structure level, so a 250-point InformationReport reads
+     *    as 250 named lines.
+     * Done unconditionally on every MMS-bearing packet, so this
+     * works on heavily anonymized captures too. */
+    if (flags.floating_point_count > 0
+        || flags.bit_string_count   > 0
+        || flags.structure_count    > 0) {
+        iccp_walk_ctx_t walk_ctx = { 0 };
+        proto_tree_children_foreach(tree, attach_decoded_values, &walk_ctx);
     }
 
     iccp_op_t op = classify_operation(&flags);
@@ -1093,6 +1316,66 @@ proto_register_iccp(void)
             "field exposes the actual numeric value.",
             HFILL }
         },
+        { &hf_iccp_quality,
+          { "Quality (decoded)", "iccp.quality",
+            FT_UINT8, BASE_HEX, NULL, 0x0,
+            "TASE.2 IndicationPoint quality byte (IEC 60870-6-503).",
+            HFILL }
+        },
+        { &hf_iccp_quality_validity,
+          { "Validity", "iccp.quality.validity",
+            FT_UINT8, BASE_DEC, VALS(iccp_q_validity_vals), ICCP_Q_VALIDITY_MASK,
+            NULL, HFILL }
+        },
+        { &hf_iccp_quality_normal,
+          { "Off-normal", "iccp.quality.off_normal",
+            FT_BOOLEAN, 8, NULL, ICCP_Q_NORMAL_MASK,
+            "0 = NORMAL, 1 = OFF_NORMAL. The point reading falls "
+            "outside its declared normal range.",
+            HFILL }
+        },
+        { &hf_iccp_quality_ts_invalid,
+          { "Timestamp invalid", "iccp.quality.timestamp_invalid",
+            FT_BOOLEAN, 8, NULL, ICCP_Q_TS_INVALID_MASK,
+            "1 = the timestamp on this point cannot be trusted.",
+            HFILL }
+        },
+        { &hf_iccp_quality_source,
+          { "Source", "iccp.quality.source",
+            FT_UINT8, BASE_DEC, VALS(iccp_q_source_vals), ICCP_Q_SOURCE_MASK,
+            NULL, HFILL }
+        },
+        { &hf_iccp_quality_summary,
+          { "Quality summary", "iccp.quality.summary",
+            FT_STRING, BASE_NONE, NULL, 0x0,
+            "Human-readable digest: VALIDITY / SOURCE / NORMAL / TS_OK",
+            HFILL }
+        },
+        { &hf_iccp_point_summary,
+          { "Point", "iccp.point",
+            FT_STRING, BASE_NONE, NULL, 0x0,
+            "TASE.2 IndicationPoint: value + quality on one line.",
+            HFILL }
+        },
+        { &hf_iccp_point_value,
+          { "Value", "iccp.point.value",
+            FT_FLOAT, BASE_NONE, NULL, 0x0,
+            "Decoded numeric value of the point.",
+            HFILL }
+        },
+        { &hf_iccp_point_quality,
+          { "Quality", "iccp.point.quality",
+            FT_STRING, BASE_NONE, NULL, 0x0,
+            "Decoded quality flags for the point.",
+            HFILL }
+        },
+        { &hf_iccp_point_index,
+          { "Index", "iccp.point.index",
+            FT_UINT32, BASE_DEC, NULL, 0x0,
+            "Position of this point in the InformationReport "
+            "(0-based, in tree-walk order).",
+            HFILL }
+        },
     };
 
     static gint *ett[] = {
@@ -1100,6 +1383,8 @@ proto_register_iccp(void)
         &ett_iccp_objects,
         &ett_iccp_device,
         &ett_iccp_value,
+        &ett_iccp_quality,
+        &ett_iccp_point,
     };
 
     static ei_register_info ei[] = {
@@ -1204,6 +1489,11 @@ proto_reg_handoff_iccp(void)
         "mms.AccessResult",
         "mms.failure",
         "mms.structure_element",
+        "mms.structure",        /* 4.6 abbrev for the same wrapper */
+        "mms.success_element",
+        "mms.success",
+        "mms.Data",
+        "mms.data_element",
         "mms.floating_point",
         "mms.data_bit-string",
         "mms.data.binary-time",
