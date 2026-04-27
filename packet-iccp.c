@@ -141,6 +141,10 @@ static int st_node_blocks     = -1;
 static int st_node_assocs     = -1;
 static int st_node_devices    = -1;
 static int st_node_reports    = -1;
+static int st_node_points_set    = -1;  /* Tier 3: pivot per Transfer-Set */
+static int st_node_points_qual   = -1;  /* Tier 3: validity-class breakdown */
+static int st_node_points_range  = -1;  /* Tier 3: value range buckets */
+static int st_node_peers         = -1;  /* Tier 5: per src->dst peer pivot */
 
 /* Tap payload: everything a listener (stats_tree, custom Lua tap, an
  * external analysis) might reasonably want to know about a single ICCP
@@ -162,6 +166,25 @@ typedef struct {
     guint32        report_success;
     guint32        report_failure;
     gboolean       report_structured;
+
+    /* Per-point synthesis accounting (Tier 3). Populated by the
+     * post-dissector's attach_decoded_values walker for any PDU that
+     * yields synthesised iccp.point rows. set_name names the
+     * Transfer-Set / variable list the points belong to (or NULL on
+     * unnamed objects -- e.g. heavily anonymised captures); the four
+     * quality counters are tallies of TASE.2 IndicationPoint quality
+     * codes seen in this PDU; the value range carries min/max/sum so
+     * stats listeners can compute means without reparsing. */
+    const char    *set_name;
+    guint32        point_count;
+    guint32        points_valid;
+    guint32        points_held;
+    guint32        points_suspect;
+    guint32        points_notvalid;
+    gfloat         point_value_min;
+    gfloat         point_value_max;
+    gfloat         point_value_sum;
+    gboolean       has_point_values;
 } iccp_tap_info_t;
 
 /* We do not cache MMS hf indices: walk_tree() matches fields by
@@ -693,7 +716,17 @@ classify_operation(const iccp_pdu_flags_t *f)
 
 /* Per-walk context so we can number points and emit aggregate stats. */
 typedef struct {
-    guint32 point_index;   /* incremented as we synthesise iccp.point rows */
+    guint32  point_index;        /* incremented as we synthesise iccp.point rows */
+    /* Per-PDU point statistics, harvested by maybe_synthesise_point()
+     * for the post-dissector to forward to the tap. */
+    guint32  points_valid;
+    guint32  points_held;
+    guint32  points_suspect;
+    guint32  points_notvalid;
+    gfloat   v_min;
+    gfloat   v_max;
+    gfloat   v_sum;
+    gboolean has_value;
 } iccp_walk_ctx_t;
 
 static void attach_decoded_values(proto_node *node, gpointer user_data);
@@ -796,6 +829,19 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
                                          fp_fi->ds_tvb, fp_fi->start, 0,
                                          ctx->point_index - 1);
     proto_item_set_generated(ii);
+
+    /* Roll the synthesised point into the per-PDU aggregates so the
+     * post-dissector can forward them to the tap (Tier 3 stats). */
+    switch ((q & ICCP_Q_VALIDITY_MASK) >> 6) {
+        case 0: ctx->points_valid++;    break;
+        case 1: ctx->points_held++;     break;
+        case 2: ctx->points_suspect++;  break;
+        case 3: ctx->points_notvalid++; break;
+    }
+    if (!ctx->has_value || v < ctx->v_min) ctx->v_min = v;
+    if (!ctx->has_value || v > ctx->v_max) ctx->v_max = v;
+    ctx->v_sum    += v;
+    ctx->has_value = TRUE;
 }
 
 /* If `node` is an mms.data_bit-string of length 1, treat it as a
@@ -893,10 +939,10 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
      *    as 250 named lines.
      * Done unconditionally on every MMS-bearing packet, so this
      * works on heavily anonymized captures too. */
+    iccp_walk_ctx_t walk_ctx = { 0 };
     if (flags.floating_point_count > 0
         || flags.bit_string_count   > 0
         || flags.structure_count    > 0) {
-        iccp_walk_ctx_t walk_ctx = { 0 };
         proto_tree_children_foreach(tree, attach_decoded_values, &walk_ctx);
     }
 
@@ -1145,6 +1191,24 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
                                    ? (flags.access_result_count - flags.failure_count) : 0;
             ti2->report_structured = (flags.structure_count > 0);
         }
+
+        /* Tier 3: forward per-point aggregates harvested by the
+         * synthesis walker. set_name comes from the same name scan
+         * that drives column/category labelling -- on captures with
+         * intact ICCP names that's the Transfer-Set / variable list;
+         * on heavily anonymised captures it's NULL and the tap
+         * listener buckets under "(unnamed)". */
+        ti2->set_name        = scan.matched_name;
+        ti2->point_count     = walk_ctx.point_index;
+        ti2->points_valid    = walk_ctx.points_valid;
+        ti2->points_held     = walk_ctx.points_held;
+        ti2->points_suspect  = walk_ctx.points_suspect;
+        ti2->points_notvalid = walk_ctx.points_notvalid;
+        ti2->point_value_min = walk_ctx.v_min;
+        ti2->point_value_max = walk_ctx.v_max;
+        ti2->point_value_sum = walk_ctx.v_sum;
+        ti2->has_point_values = walk_ctx.has_value;
+
         tap_queue_packet(proto_iccp_tap, pinfo, ti2);
     }
 
@@ -1168,11 +1232,21 @@ iccp_stats_tree_init(stats_tree *st)
     st_node_assocs     = stats_tree_create_node(st, "Association state",  0, STAT_DT_INT, TRUE);
     st_node_devices    = stats_tree_create_node(st, "Device sub-operation", 0, STAT_DT_INT, TRUE);
     st_node_reports    = stats_tree_create_node(st, "Report outcomes",     0, STAT_DT_INT, TRUE);
+    /* Tier 3: per-Transfer-Set point counts. Pivot keyed on
+     * scan.matched_name (the variable list / object name); each leaf
+     * tallies how many TASE.2 IndicationPoints were carried. */
+    st_node_points_set   = stats_tree_create_node(st, "Points per Transfer Set", 0, STAT_DT_INT, TRUE);
+    st_node_points_qual  = stats_tree_create_node(st, "Point quality",           0, STAT_DT_INT, TRUE);
+    st_node_points_range = stats_tree_create_node(st, "Point value range",       0, STAT_DT_INT, TRUE);
+    /* Tier 5: per-peer activity. Pivot keyed on "src -> dst". Acts as
+     * a lightweight ICCP conversation table without the weight of
+     * register_conversation_table(). */
+    st_node_peers        = stats_tree_create_node(st, "ICCP peers",              0, STAT_DT_INT, TRUE);
 }
 
 static tap_packet_status
 iccp_stats_tree_packet(stats_tree *st,
-                       packet_info *pinfo _U_,
+                       packet_info *pinfo,
                        epan_dissect_t *edt _U_,
                        const void *p,
                        tap_flags_t flags _U_)
@@ -1218,6 +1292,52 @@ iccp_stats_tree_packet(stats_tree *st,
         if (ti->report_structured) {
             tick_stat_node(st, "structured (TASE.2-shaped)", st_node_reports, FALSE);
         }
+    }
+
+    /* Tier 3: per-Transfer-Set, quality, and value-range buckets.
+     * Each iccp.point synthesised in this PDU becomes one tick under
+     * the set name and one tick under its validity class. */
+    if (ti->point_count > 0) {
+        const char *set = (ti->set_name && *ti->set_name) ? ti->set_name : "(unnamed)";
+        tick_stat_node(st, "Points per Transfer Set", 0, TRUE);
+        for (guint32 i = 0; i < ti->point_count; i++) {
+            tick_stat_node(st, set, st_node_points_set, FALSE);
+        }
+
+        tick_stat_node(st, "Point quality", 0, TRUE);
+        for (guint32 i = 0; i < ti->points_valid;    i++) tick_stat_node(st, "VALID",     st_node_points_qual, FALSE);
+        for (guint32 i = 0; i < ti->points_held;     i++) tick_stat_node(st, "HELD",      st_node_points_qual, FALSE);
+        for (guint32 i = 0; i < ti->points_suspect;  i++) tick_stat_node(st, "SUSPECT",   st_node_points_qual, FALSE);
+        for (guint32 i = 0; i < ti->points_notvalid; i++) tick_stat_node(st, "NOT_VALID", st_node_points_qual, FALSE);
+
+        if (ti->has_point_values) {
+            /* Coarse value-range buckets useful for sanity-checking a
+             * grid capture at a glance (frequency vs MW vs setpoint
+             * scale). The same data is in iccp.point.value for
+             * fine-grained graphing via I/O Graph. */
+            tick_stat_node(st, "Point value range", 0, TRUE);
+            const char *bucket;
+            if      (ti->point_value_max < 0)        bucket = "negative";
+            else if (ti->point_value_max < 1)        bucket = "0..1 (per-unit)";
+            else if (ti->point_value_max < 60)       bucket = "1..60 (Hz / pct)";
+            else if (ti->point_value_max < 1000)     bucket = "60..1000";
+            else if (ti->point_value_max < 100000)   bucket = "1k..100k";
+            else                                     bucket = ">=100k";
+            tick_stat_node(st, bucket, st_node_points_range, FALSE);
+        }
+    }
+
+    /* Tier 5: per-peer pivot. address_to_str allocates from NULL pool
+     * (heap), tick_stat_node copies the key, free immediately. */
+    {
+        char *src = address_to_str(NULL, &pinfo->src);
+        char *dst = address_to_str(NULL, &pinfo->dst);
+        char  key[160];
+        g_snprintf(key, sizeof key, "%s -> %s", src ? src : "?", dst ? dst : "?");
+        tick_stat_node(st, "ICCP peers", 0, TRUE);
+        tick_stat_node(st, key, st_node_peers, FALSE);
+        wmem_free(NULL, src);
+        wmem_free(NULL, dst);
     }
 
     return TAP_PACKET_REDRAW;
