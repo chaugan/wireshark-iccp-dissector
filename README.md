@@ -10,63 +10,102 @@ for Windows Wireshark. Runs as a **post-dissector** on top of Wireshark's
 existing MMS stack (TPKT → COTP → ISO 8327 Session → ISO 8823 Presentation
 → ACSE → MMS); it does not re-parse MMS but adds a semantic layer on top.
 
-## What it does
+## Where things work — tshark vs Wireshark GUI
 
-- Marks ICCP associations in the Protocol column (`ICCP`)
-- Tracks each association's state: `Candidate (Initiate seen) → Confirmed ICCP`
+Be aware of this asymmetry before you decide what this plugin is worth:
+
+| Capability                                                | tshark CLI                  | Wireshark GUI                                                                  |
+|-----------------------------------------------------------|-----------------------------|--------------------------------------------------------------------------------|
+| ICCP tree under the MMS tree (Operation, CB, scope, …)    | yes                         | yes                                                                            |
+| Synthesised `Point #N: <value> [quality]` rows            | yes                         | yes                                                                            |
+| Inline IEEE-754 float decode under `mms.floating_point`   | yes                         | yes                                                                            |
+| TASE.2 quality byte → named flag subfields                | yes                         | yes                                                                            |
+| Display filters (`iccp`, `iccp.point.value`, `iccp.scope`, …) | yes                     | yes — **but the GUI's first-pass column-load needs `Ctrl+R` after opening a fresh file before filters match** |
+| Protocol column reads `ICCP`                              | yes                         | **no** — Wireshark renders the GUI's Protocol column from the layer chain *before* post-dissectors run, so it stays `MMS/IEC61850` |
+| Info column reads `ICCP InformationReport`                | yes                         | **no** — same reason as Protocol column                                        |
+| `Statistics → ICCP/Statistics` populates                  | yes (`-z iccp,tree`)        | works after `Ctrl+R` in many flows, has shown 0 counts in some — depends on Wireshark's retap timing; tshark `-z iccp,tree` is the reliable path |
+| Expert-info on SBO violations                             | yes (synthetic capture)     | yes (synthetic capture)                                                        |
+
+The GUI column ceiling is a Wireshark architectural constraint we
+chase in v0.4 by restructuring as a wrapping dissector instead of a
+post-dissector. The functional analysis (the tree, the filters, the
+stats, the expert info) is intact today in both interfaces.
+
+## What it does (functional behaviour, valid in both tshark and GUI)
+
+- Recognises ICCP associations and tracks each association's lifecycle
+  (`Candidate (Initiate seen) → Confirmed ICCP → Closed`) across the
+  whole conversation, not just per-PDU
 - Classifies every matched MMS object name against TASE.2 reserved
   names and maps to one of the nine IEC 60870-6-503 Conformance Blocks
 - Labels each MMS operation in ICCP terms: `Associate-Request`,
   `Read-Request`, `Read-Response`, `Write-Request`, `InformationReport`,
-  `DefineNamedVariableList-Request`, …
+  `DefineNamedVariableList-Request`, … (visible in the iccp tree, and
+  in tshark's Info column)
+- Distinguishes name scope: `VCC` (VMD-global, public inside the
+  control center) vs `Bilateral` (scoped to a Bilateral Table /
+  peer-pair); surfaces the Bilateral Table domain id when present
 - For Block 5 Device Control, tracks per-device state
-  (Idle → Selected → Operated) across the association and raises
+  (`Idle → Selected → Operated`) across the association and raises
   expert-info on anomalies: Operate without prior Select (SBO
-  violation, Error severity), Direct Operate on a device (Warning)
+  violation, Error severity), Direct Operate on a device (Warning).
+  *Tested on the synthetic capture from `scripts/gen-pcap.sh`; we have
+  no real-world Block-5 traffic to validate against.*
+- Synthesises per-point rows for TASE.2 IndicationPoints: a structure
+  of `(floating-point, bit-string)` becomes
+  `Point #N: 49.998 [VALID / CURRENT / NORMAL / TS_OK]` on a single
+  line under the MMS tree
+- Decodes the TASE.2 quality byte into named filterable subfields
+  (`iccp.quality.validity / .normal / .ts_invalid / .source`)
+- Decodes `mms.floating_point` bytes inline as IEEE-754 (so
+  `0800000000` shows `Decoded float: 0.0` next to the raw hex)
 - Never false-positives plain IEC 61850 MMS traffic as ICCP —
   associations that never see a TASE.2 reserved name stay in
   `Candidate` state and are not promoted
 
 ## Features at a glance
 
-A condensed list of what plain MMS gives you vs what this plugin adds
-on top. The plugin enriches MMS — it does not replace it — so all
-MMS-level dissection still works underneath.
+What plain MMS gives you vs what this plugin adds. "GUI" below means
+"after `Ctrl+R` on a fresh file open" because of the first-pass
+column-load issue documented above.
 
 | Area                          | Plain MMS shows                  | This plugin adds                                                                            |
 |-------------------------------|----------------------------------|---------------------------------------------------------------------------------------------|
-| **Protocol identification**   | `MMS` or `MMS/IEC61850`          | `ICCP` Protocol column, `iccp` display filter, association state machine                    |
+| **ICCP subtree**              | nothing                          | An `[Inter-Control Center Communications Protocol (ICCP/TASE.2)]` block under MMS with operation, association state, conformance block, scope, domain, point summaries, report counts |
 | **Naming conventions**        | raw `domainId.itemId` strings    | TASE.2 category (Bilateral Table, DSConditions, Device, Information_Message, …) + CB number |
-| **Name scope**                | `domain-specific` vs `vmd-specific` enum | `iccp.scope` field: `VCC` (public) vs `Bilateral` (peer-pair / Bilateral Table id)          |
+| **Name scope**                | `domain-specific` vs `vmd-specific` enum | `iccp.scope` field: `VCC` (public) vs `Bilateral` (peer-pair); Bilateral Table domain id surfaced |
 | **Association tracking**      | per-MMS-PDU only                 | per-conversation `Candidate → Confirmed → Closed` state across the whole flow              |
-| **Block 5 Device Control**    | raw `Device_*Select / Operate` writes | cross-conversation SBO state machine (Idle → Selected → Operated) with timeout enforcement  |
-| **SBO security**              | nothing                          | Expert-info on SBO violation (Operate without Select), Direct Operate, stale Select         |
-| **Floating-point values**     | `0800000000` (raw 5-byte hex)    | Inline IEEE-754 decode rendered next to the raw bytes (`Decoded float: 49.978`)             |
+| **Block 5 Device Control**    | raw `Device_*Select / Operate` writes | cross-conversation SBO state machine (Idle → Selected → Operated). Validated on synthetic capture only |
+| **SBO security**              | nothing                          | Expert-info on SBO violation (Operate without Select), Direct Operate, stale Select. Synthetic only |
+| **Floating-point values**     | `0800000000` (raw 5-byte hex)    | Inline IEEE-754 decode under each `mms.floating_point` leaf (`Decoded float: 49.978`)       |
 | **Quality bytes**             | `bit-string: 80` (raw)           | Decoded TASE.2 IndicationPoint quality: Validity / Normal / TS_invalid / Source flags + summary |
 | **IndicationPoints**          | structure of (float, bit-string) | Synthesised `Point #N: <value> [VALID / CURRENT / NORMAL / TS_OK]` row per point            |
 | **Transfer Set reports**      | `success / failure` per item     | `iccp.report.*`: per-PDU points / success / failure / structured summary                    |
-| **Operation column**          | `unconfirmed-PDU informationReport` | `ICCP InformationReport`, `ICCP Read-Request [Bilateral Table: <name>]`, …                  |
-| **Statistics → ICCP**         | none                             | Operation, Object category, Conformance Block, Association state, Device sub-operation, Report outcomes, Points per Transfer Set, Point quality, Point value range, ICCP peers (src→dst), Operations by scope |
-| **External tap**              | none                             | `register_tap("iccp")` exposing per-packet ICCP attributes for Lua / custom listeners        |
-| **Display filters**           | `mms.*`                          | `iccp`, `iccp.point.value` (FT_FLOAT, graphable), `iccp.quality.validity`, `iccp.scope`, `iccp.domain`, `iccp.cb`, `iccp.device.state`, `iccp.object.category`, `iccp.report.*` |
-| **I/O graphs**                | not meaningful for MMS           | `AVG(iccp.point.value)` plots grid frequency / MW / setpoints directly from a capture       |
-| **PCAP scrubbing**            | not provided                     | `scripts/wash-pcap.py` SHA-256-hashes BER strings (and optionally numeric values) so a real utility capture can be shared without leaking site data |
+| **Protocol column**           | `MMS/IEC61850`                   | tshark: `ICCP`. Wireshark GUI: still `MMS/IEC61850` — see the asymmetry table above         |
+| **Info column**               | varies by MMS PDU                | tshark: `ICCP InformationReport [<category>: <name>]`. Wireshark GUI: not overridden by us, you see whatever MMS wrote |
+| **Statistics tree axes**      | none                             | Operation, Object category, Conformance Block, Association state, Device sub-operation, Report outcomes, Points per Transfer Set, Point quality, Point value range, ICCP peers (src→dst), Operations by scope |
+| **External tap**              | none                             | `register_tap("iccp")` exposes per-packet ICCP attributes (op, cb, category, scope, domain, point counts, quality breakdown, value min/max/sum) to Lua / custom listeners |
+| **Display filters**           | `mms.*`                          | `iccp`, `iccp.point.value` (FT_FLOAT, I/O-graphable), `iccp.quality.*`, `iccp.scope`, `iccp.domain`, `iccp.cb`, `iccp.device.state`, `iccp.object.category`, `iccp.report.*` |
+| **I/O graphs**                | not meaningful for MMS           | `AVG(iccp.point.value)` plots grid frequency / MW / setpoints from a capture                |
+| **PCAP scrubbing**            | not provided                     | `scripts/wash-pcap.py` SHA-256-hashes BER strings; `--scrub-numeric` also redacts primitive numeric values (off by default — turning it on can break MMS dispatch on captures that key off specific values) |
 
 ### Conformance-Block coverage
 
-| Block | Topic                                | This plugin |
-|-------|--------------------------------------|-------------|
-| 1     | Bilateral Table / version            | Recognised, Bilateral domain surfaced |
-| 2     | DSConditions / Transfer Sets         | Recognised, point synthesis + per-set stats |
-| 3     | Information Messages                 | Recognised by name pattern |
-| 4     | Program Control                      | Recognised by name pattern |
-| 5     | Device Control                       | Full SBO state machine + expert info |
-| 6     | Event Conditions                     | Recognised by name pattern |
-| 7     | Account tracking                     | Recognised by name pattern |
-| 8     | Time Series                          | Recognised by name pattern |
-| 9     | Additional / extended quality        | Recognised by name pattern |
+| Block | Topic                                | This plugin                                                                                |
+|-------|--------------------------------------|--------------------------------------------------------------------------------------------|
+| 1     | Bilateral Table / version            | Names recognised; Bilateral scope + domain id surfaced                                     |
+| 2     | DSConditions / Transfer Sets         | Names recognised; (float, bit-string) point synthesis; per-set stats                       |
+| 3     | Information Messages                 | Names recognised by pattern; no payload-typed decode yet                                   |
+| 4     | Program Control                      | Names recognised by pattern; no payload-typed decode yet                                   |
+| 5     | Device Control                       | Full SBO state machine + expert info. Validated on synthetic capture; no real Block-5 PCAP |
+| 6     | Event Conditions                     | Names recognised by pattern; no payload-typed decode yet                                   |
+| 7     | Account tracking                     | Names recognised by pattern; no payload-typed decode yet                                   |
+| 8     | Time Series                          | Names recognised by pattern; no payload-typed decode yet                                   |
+| 9     | Additional / extended quality        | Names recognised by pattern; no payload-typed decode yet                                   |
 
-Phases 4-9 deeper decode (typed-data parsing per block) is on the roadmap; current Phase 1-3 deliverables cover the blocks utility operators run in production.
+Phases 4–9 deeper decode (typed-data parsing per block) is roadmap;
+Phase 1–3 deliverables cover Blocks 1, 2, 5 — the ones utility
+operators actually run in production.
 
 ## Display filter fields
 
@@ -79,29 +118,36 @@ Phases 4-9 deeper decode (typed-data parsing per block) is on the roadmap; curre
 | `iccp.object.category`      | string  | `Bilateral Table`, `Device SBO Operate`, …          |
 | `iccp.cb`                   | uint8   | Conformance Block number (1..9)                     |
 | `iccp.device.state`         | string  | `Idle` / `Selected` / `Operated`                    |
-| `iccp.scope`                | string  | `VCC` (public) or `Bilateral` (peer-pair scope)     |
-| `iccp.domain`               | string  | Bilateral Table id when scope=Bilateral             |
-| `iccp.point`                | string  | Synthesised `Point #N: <value> [quality]` row       |
-| `iccp.point.value`          | float   | Decoded numeric point value (graphable in I/O)      |
-| `iccp.point.quality`        | string  | Per-point quality summary                           |
-| `iccp.quality.validity`     | uint8   | 0=VALID, 1=HELD, 2=SUSPECT, 3=NOT_VALID             |
-| `iccp.quality.normal`       | bool    | Off-normal flag                                     |
-| `iccp.quality.ts_invalid`   | bool    | Timestamp invalid flag                              |
-| `iccp.quality.source`       | uint8   | 0=CURRENT, 1=HELD, 2=SUBSTITUTED, 3=GARBLED         |
-| `iccp.value.real`           | float   | Inline-decoded MMS floating-point primitive         |
-| `iccp.report.points`        | uint32  | Total AccessResult items in an InformationReport    |
-| `iccp.report.success`       | uint32  | Successful items                                    |
-| `iccp.report.failure`       | uint32  | Failed items                                        |
+| `iccp.scope`                       | string  | `VCC` (public) or `Bilateral` (peer-pair scope)     |
+| `iccp.domain`                      | string  | Bilateral Table id when scope=Bilateral             |
+| `iccp.note`                        | string  | Free-form annotation attached to PDUs of interest   |
+| `iccp.point`                       | string  | Synthesised `Point #N: <value> [quality]` row       |
+| `iccp.point.value`                 | float   | Decoded numeric point value (graphable in I/O)      |
+| `iccp.point.quality`               | string  | Per-point quality summary                           |
+| `iccp.point.index`                 | uint32  | Sequential index assigned within the PDU            |
+| `iccp.quality`                     | uint8   | Raw TASE.2 quality byte (bitmask parent)            |
+| `iccp.quality.validity`            | uint8   | 0=VALID, 1=HELD, 2=SUSPECT, 3=NOT_VALID             |
+| `iccp.quality.off_normal`          | bool    | Off-normal flag (bit 5)                             |
+| `iccp.quality.timestamp_invalid`   | bool    | Timestamp invalid flag (bit 4)                      |
+| `iccp.quality.source`              | uint8   | 0=CURRENT, 1=HELD, 2=SUBSTITUTED, 3=GARBLED         |
+| `iccp.quality.summary`             | string  | One-line `VALIDITY / SOURCE / NORMAL / TS_OK` digest |
+| `iccp.value.real`                  | float   | Inline-decoded MMS floating-point primitive         |
+| `iccp.report.point_count`          | uint32  | Total AccessResult items in an InformationReport    |
+| `iccp.report.success_count`        | uint32  | Successful items                                    |
+| `iccp.report.failure_count`        | uint32  | Failed items                                        |
+| `iccp.report.structured`           | bool    | Whether the report payload contains TASE.2-shaped structures |
+| `iccp.report.summary`              | string  | Human-readable per-PDU report summary               |
 
-Expert-info filters:
+Expert-info filters (each fires under specific ICCP conditions):
 
-| Filter                                                 | Severity     |
-|--------------------------------------------------------|--------------|
-| `_ws.expert.message contains "SBO violation"`          | Error        |
-| `_ws.expert.message contains "physical device action"` | Warning      |
-| `_ws.expert.message contains "stale_select"`           | Warning      |
-| `_ws.expert.message contains "association handshake"`  | Note         |
-| `_ws.expert.message contains "reserved object name"`   | Chat         |
+| Filter                                                       | Severity     | Fires on                                                |
+|--------------------------------------------------------------|--------------|---------------------------------------------------------|
+| `_ws.expert.message contains "SBO violation"`                | Error        | Device Operate without a preceding Select               |
+| `_ws.expert.message contains "physical device action"`       | Warning      | Device Operate (any) — physical action requested        |
+| `_ws.expert.message contains "long after Select"`            | Warning      | Operate after the Select-Before-Operate timeout window  |
+| `_ws.expert.message contains "association handshake"`        | Note         | A-ASSOCIATE Initiate-Request / -Response observed       |
+| `_ws.expert.message contains "InformationReport"`            | Note         | InformationReport on an ICCP association                |
+| `_ws.expert.message contains "reserved object name"`         | Chat         | An MMS name matched a TASE.2 reserved pattern           |
 
 ## Supported Wireshark versions
 
@@ -453,7 +499,13 @@ tshark -r your.pcap -o 'pres.users_table:"3","1.0.9506.2.1"' \
 
 You should see `eth:ethertype:ip:tcp:cotp:ses:pres:mms` on data frames.
 From that point our ICCP post-dissector fires and `iccp.operation`,
-`iccp.object.category`, `iccp.cb`, etc. become valid display filters.
+`iccp.object.category`, `iccp.cb`, etc. become valid display filters in
+**tshark**. In the **Wireshark GUI** the same filters work but you may
+need to press `Ctrl+R` once after opening the file to rebuild the
+field-info index — Wireshark's first-pass column load skips
+post-dissector tree work, so `iccp.*` fields don't materialise until a
+full re-dissection is forced. The ICCP subtree itself is always built
+when you click on a frame to inspect it.
 
 If MMS still doesn't dispatch, the peers may have negotiated a
 vendor-specific abstract-syntax OID instead of the canonical
