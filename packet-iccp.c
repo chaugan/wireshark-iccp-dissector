@@ -697,34 +697,35 @@ walk_tree(packet_info *pinfo _U_, proto_tree *tree,
         else if (!strcmp(s, "data.binary-time"))    flags->binary_time_count++;
         else if (!strcmp(s, "data.visible-string")) flags->visible_string_count++;
         else if (!strcmp(s, "data.octet-string"))   flags->octet_string_count++;
+        /* Variable-identifier fields: Identifier, itemId, vmd_specific,
+         * newIdentifier. These carry the actual variable / object name
+         * we want to classify and surface as iccp.object.name. */
         else if (!strcmp(s, "Identifier")
               || !strcmp(s, "itemId")
               || !strcmp(s, "vmd_specific")
-              || !strcmp(s, "domainId")
-              || !strcmp(s, "domainSpecific")
               || !strcmp(s, "newIdentifier")) {
             if (fi->value) {
                 const char *sv = fvalue_get_string(fi->value);
                 iccp_consider_name(scan, sv);
-                /* Record name scope. mms.vmd_specific marks a VCC
-                 * name; mms.domainId marks the Bilateral / ICC
-                 * domain (the table both peers share); the itemId
-                 * inside lives in that domain. We set Bilateral on
-                 * either domainId or domainSpecific because the
-                 * MMS dissector emits one or the other depending on
-                 * which CHOICE alternative it took. Once Bilateral
-                 * is set we don't downgrade to VCC. */
-                if (!strcmp(s, "vmd_specific")) {
-                    if (scan->scope == ICCP_SCOPE_NONE)
-                        scan->scope = ICCP_SCOPE_VCC;
-                } else if (!strcmp(s, "domainId")) {
-                    scan->scope     = ICCP_SCOPE_BILATERAL;
-                    scan->domain_id = sv;
-                } else if (!strcmp(s, "domainSpecific")) {
-                    if (scan->scope == ICCP_SCOPE_NONE)
-                        scan->scope = ICCP_SCOPE_BILATERAL;
-                }
+                /* mms.vmd_specific marks a VCC-scope name. */
+                if (!strcmp(s, "vmd_specific") && scan->scope == ICCP_SCOPE_NONE)
+                    scan->scope = ICCP_SCOPE_VCC;
             }
+        }
+        /* Domain-marker fields: domainId carries the Bilateral Table id;
+         * domainSpecific is the SEQUENCE wrapper that confirms scope.
+         * These do NOT feed iccp_consider_name -- the domain is not the
+         * "name we care about" for object classification or stats
+         * bucketing; that's the variable identifier inside the domain. */
+        else if (!strcmp(s, "domainId")) {
+            if (fi->value) {
+                scan->scope     = ICCP_SCOPE_BILATERAL;
+                scan->domain_id = fvalue_get_string(fi->value);
+            }
+        }
+        else if (!strcmp(s, "domainSpecific")) {
+            if (scan->scope == ICCP_SCOPE_NONE)
+                scan->scope = ICCP_SCOPE_BILATERAL;
         }
     }
 }
@@ -1292,7 +1293,12 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
          * intact ICCP names that's the Transfer-Set / variable list;
          * on heavily anonymised captures it's NULL and the tap
          * listener buckets under "(unnamed)". */
-        ti2->set_name        = scan.matched_name;
+        /* Prefer this PDU's matched name; if no TASE.2 reserved pattern
+         * matched, fall back to the first variable identifier seen on
+         * the wire. Without this fallback, every Statkraft-internal
+         * (or other vendor-specific) name buckets under "(unnamed)"
+         * in the per-set stats tree. */
+        ti2->set_name        = scan.matched_name ? scan.matched_name : scan.first_name;
         ti2->scope           = iccp_scope_str(scan.scope);
         ti2->domain_id       = scan.domain_id;
         ti2->point_count     = walk_ctx.point_index;
@@ -1404,20 +1410,29 @@ iccp_stats_tree_packet(stats_tree *st,
     }
 
     /* Tier 3: per-Transfer-Set, quality, and value-range buckets.
-     * Each iccp.point synthesised in this PDU becomes one tick under
-     * the set name and one tick under its validity class. */
+     * Each iccp.point synthesised in this PDU contributes N to the set
+     * and N to its validity class. The parent must accumulate the same
+     * total (not just one tick per PDU) or Wireshark renders nonsense
+     * percentages -- a 28-point PDU with the parent ticked once and
+     * the child ticked 28 times produces "2800%" in the GUI. */
     if (ti->point_count > 0) {
         const char *set = (ti->set_name && *ti->set_name) ? ti->set_name : "(unnamed)";
-        tick_stat_node(st, "Points per Transfer Set", 0, TRUE);
-        for (guint32 i = 0; i < ti->point_count; i++) {
-            tick_stat_node(st, set, st_node_points_set, FALSE);
-        }
+        increase_stat_node(st, "Points per Transfer Set", 0, TRUE,  ti->point_count);
+        increase_stat_node(st, set,             st_node_points_set, FALSE, ti->point_count);
 
-        tick_stat_node(st, "Point quality", 0, TRUE);
-        for (guint32 i = 0; i < ti->points_valid;    i++) tick_stat_node(st, "VALID",     st_node_points_qual, FALSE);
-        for (guint32 i = 0; i < ti->points_held;     i++) tick_stat_node(st, "HELD",      st_node_points_qual, FALSE);
-        for (guint32 i = 0; i < ti->points_suspect;  i++) tick_stat_node(st, "SUSPECT",   st_node_points_qual, FALSE);
-        for (guint32 i = 0; i < ti->points_notvalid; i++) tick_stat_node(st, "NOT_VALID", st_node_points_qual, FALSE);
+        guint32 q_total = ti->points_valid + ti->points_held +
+                          ti->points_suspect + ti->points_notvalid;
+        if (q_total > 0) {
+            increase_stat_node(st, "Point quality", 0, TRUE, q_total);
+            if (ti->points_valid)
+                increase_stat_node(st, "VALID",     st_node_points_qual, FALSE, ti->points_valid);
+            if (ti->points_held)
+                increase_stat_node(st, "HELD",      st_node_points_qual, FALSE, ti->points_held);
+            if (ti->points_suspect)
+                increase_stat_node(st, "SUSPECT",   st_node_points_qual, FALSE, ti->points_suspect);
+            if (ti->points_notvalid)
+                increase_stat_node(st, "NOT_VALID", st_node_points_qual, FALSE, ti->points_notvalid);
+        }
 
         if (ti->has_point_values) {
             /* Coarse value-range buckets useful for sanity-checking a
