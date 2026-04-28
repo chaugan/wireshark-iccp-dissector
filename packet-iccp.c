@@ -57,6 +57,12 @@
 #include <epan/stats_tree.h>
 #include <wsutil/wmem/wmem_map.h>
 #include <wsutil/wmem/wmem_array.h>
+#include <epan/uat.h>
+
+/* uat_add_record is exported from libwireshark but its prototype lives
+ * in epan/uat-int.h which plugins should not depend on. Declare it
+ * locally with the same signature. Stable across Wireshark 3.x/4.x. */
+extern void *uat_add_record(uat_t *uat, const void *orig_rec_ptr, bool valid_rec);
 
 #include <string.h>
 
@@ -326,6 +332,28 @@ static const iccp_name_pattern_t iccp_name_patterns[] = {
     /* Block 9 - Additional / error handling */
     { "Error_Log",              "Error Log",                      9 },
     { "Error_Code_",            "Error Code",                     9 },
+
+    /* Heuristic patterns for utility-internal naming conventions that
+     * don't match the canonical IEC 60870-6-503 reserved names. These
+     * come AFTER the canonical patterns so a name that matches a
+     * canonical token (DSConditions_, DSTransfer_Set_, DSTimeSeries_)
+     * classifies under the canonical category, not the heuristic one.
+     *
+     * Real-world ICCP captures from electric utilities (Statkraft,
+     * Statnett, Glitre, etc. observed) overwhelmingly use names like
+     *   DS_ANA_A_L_<utility>          analog point dataset
+     *   DS_DIG_X_Y_<utility>          digital point dataset
+     *   <utility>_MEA / *_MEA_1       measurement transfer set
+     *   <utility>_<scope>_CYCLIC      cyclic transfer set
+     *   R00L00DataSet0001DA98         vendor-internal dataset id
+     * which all carry valid TASE.2 IndicationPoint payloads but
+     * wouldn't otherwise classify. With these heuristic patterns the
+     * Object category / Conformance Block axes light up and the
+     * association lifecycle promotes to Confirmed ICCP. */
+    { "DS_",                    "Data Set (heuristic)",            2 },
+    { "DataSet",                "Data Set (heuristic)",            2 },
+    { "_MEA",                   "Measurement Set (heuristic)",     2 },
+    { "_CYCLIC",                "Cyclic Transfer Set (heuristic)", 2 },
 
     { NULL, NULL, 0 }
 };
@@ -1861,9 +1889,74 @@ iccp_force_tree_packet(void *tapdata _U_, packet_info *pinfo _U_,
     return TAP_PACKET_DONT_REDRAW;
 }
 
+/* Auto-inject the canonical ICCP / TASE.2 PRES context binding.
+ *
+ * Real-world ICCP captures almost universally use Presentation Context
+ * Identifier 3 mapped to MMS abstract syntax 1.0.9506.2.1, but that
+ * mapping is normally negotiated in the A-ASSOCIATE (AARQ/AARE)
+ * exchange at the start of an association. Captures that start
+ * mid-session (the typical case for utility operators dropping a tap
+ * on a long-lived link) miss the AARQ. Without the mapping, Wireshark
+ * marks every DT SPDU as "dissector is not available", MMS never
+ * dispatches, and our post-dissector never sees the data.
+ *
+ * The standard manual workaround is documented in the README's
+ * "Using the plugin on a real-world ICCP capture" section: edit
+ * Edit -> Preferences -> Protocols -> PRES -> Users Context List.
+ * That step is fragile (every fresh user trips on it) and silently
+ * makes the plugin look broken on perfectly-good captures.
+ *
+ * Instead we add the canonical ICCP binding to the in-memory
+ * pres.users_table at plugin load time. If the user already has an
+ * entry for PCI 3 with a different OID, our entry doesn't override
+ * it -- pres looks up by ctx_id and returns the first match, and
+ * our load happens at plugin handoff which is BEFORE the file
+ * preferences are loaded back into the UAT. Net effect: when the
+ * user has a custom binding, theirs wins; when they don't, our
+ * canonical default kicks in and the capture just works.
+ *
+ * Idempotent via a static guard so re-handoff (triggered by pref
+ * changes elsewhere) doesn't accumulate duplicate entries. */
+static void
+iccp_inject_pres_binding(void)
+{
+    static gboolean injected = FALSE;
+    if (injected) return;
+    injected = TRUE;
+
+    uat_t *pres_uat = uat_get_table_by_name("PRES Users Context List");
+    if (!pres_uat) return;
+
+    /* pres_user_t layout from epan/dissectors/packet-pres.c (stable
+     * across Wireshark 3.x / 4.x). uat_add_record invokes the table's
+     * registered copy_cb (pres_copy_cb) which deep-copies the OID,
+     * so our string literal pointer is fine -- PRES owns the copy. */
+    typedef struct {
+        unsigned  ctx_id;
+        char     *oid;
+    } iccp_pres_user_t;
+
+    static const struct {
+        unsigned    ctx_id;
+        const char *oid;
+        const char *label;
+    } defaults[] = {
+        { 3, "1.0.9506.2.1", "MMS / TASE.2 (canonical ICCP PCI)" },
+    };
+    for (size_t i = 0; i < sizeof defaults / sizeof defaults[0]; i++) {
+        iccp_pres_user_t rec = {
+            .ctx_id = defaults[i].ctx_id,
+            .oid    = (char *)defaults[i].oid,
+        };
+        uat_add_record(pres_uat, &rec, TRUE);
+    }
+}
+
 void
 proto_reg_handoff_iccp(void)
 {
+    iccp_inject_pres_binding();
+
     /* Tell epan to keep these MMS fields alive in the proto tree so our
      * post-dissector can read them even when tshark is running without
      * -V. asn2wrs registers duplicate hf ids for CHOICE alternatives
