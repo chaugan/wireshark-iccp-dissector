@@ -1132,8 +1132,12 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
      * Done unconditionally on every MMS-bearing packet, so this
      * works on heavily anonymized captures too. */
     iccp_walk_ctx_t walk_ctx = { 0 };
-    walk_ctx.point_values     = wmem_array_new(pinfo->pool, sizeof(gfloat));
-    walk_ctx.point_validities = wmem_array_new(pinfo->pool, sizeof(guint8));
+    /* Per-point arrays live in wmem_file_scope (not pinfo->pool) so the
+     * tap_info that references them survives Wireshark stats-listener
+     * replay across retaps and dialog re-opens. See the tap_info
+     * allocation comment for the full rationale. */
+    walk_ctx.point_values     = wmem_array_new(wmem_file_scope(), sizeof(gfloat));
+    walk_ctx.point_validities = wmem_array_new(wmem_file_scope(), sizeof(guint8));
     if (flags.floating_point_count > 0
         || flags.bit_string_count   > 0
         || flags.structure_count    > 0) {
@@ -1405,19 +1409,34 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
      * interested in ICCP packet attributes. Packet-scope allocation:
      * listeners must copy anything they want to keep. */
     if (have_tap_listener(proto_iccp_tap)) {
-        iccp_tap_info_t *ti2 = wmem_new0(pinfo->pool, iccp_tap_info_t);
+        /* Allocate the tap-info struct in wmem_file_scope rather than
+         * pinfo->pool. Wireshark's GUI stats listener replays cached
+         * tap data on retap and on dialog re-open without re-running
+         * dissection in some flows; pinfo->pool is freed at end of
+         * each packet's dissection, so tap_info structs allocated
+         * there end up dangling -- the unconditional axes (ICCP peers,
+         * PDU sizes, which read from pinfo) still fire but every
+         * conditional axis (Operation, Object category, Conformance
+         * Block, ...) reads NULL/zero from the dangling memory and
+         * silently drops the tick. wmem_file_scope persists for the
+         * file's lifetime so replays always see live data. */
+        iccp_tap_info_t *ti2 = wmem_new0(wmem_file_scope(), iccp_tap_info_t);
         ti2->op              = (int)op;
-        ti2->op_str          = iccp_op_str(op);
+        ti2->op_str          = iccp_op_str(op);                /* string literal */
         ti2->assoc_state     = (int)info->state;
         if (scan.matched) {
             ti2->cb              = scan.matched->cb;
-            ti2->object_category = scan.matched->category;
-            ti2->object_name     = scan.matched_name;
+            ti2->object_category = scan.matched->category;     /* static patterns table */
+            /* scan.matched_name points into MMS dissector's pinfo->pool;
+             * dup into file_scope for replay safety. */
+            ti2->object_name     = scan.matched_name
+                                 ? wmem_strdup(wmem_file_scope(), scan.matched_name)
+                                 : NULL;
         }
         if (dev) {
-            ti2->device_name  = dev->name;
+            ti2->device_name  = dev->name;                     /* already wmem_file_scope */
             ti2->device_state = (int)dev->state;
-            ti2->device_sub   = dev_sub;
+            ti2->device_sub   = dev_sub;                       /* string literal */
         }
         if (flags.access_result_count > 0
             && (op == ICCP_OP_INFORMATION_REPORT
@@ -1441,9 +1460,16 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
          * the wire. Without this fallback, every Statkraft-internal
          * (or other vendor-specific) name buckets under "(unnamed)"
          * in the per-set stats tree. */
-        ti2->set_name        = scan.matched_name ? scan.matched_name : scan.first_name;
-        ti2->scope           = iccp_scope_str(scan.scope);
-        ti2->domain_id       = scan.domain_id;
+        /* set_name and domain_id come from MMS pinfo->pool; dup into
+         * file_scope for replay safety (see ti2 allocation comment). */
+        {
+            const char *raw_set = scan.matched_name ? scan.matched_name : scan.first_name;
+            ti2->set_name = raw_set ? wmem_strdup(wmem_file_scope(), raw_set) : NULL;
+        }
+        ti2->scope           = iccp_scope_str(scan.scope);     /* string literal */
+        ti2->domain_id       = scan.domain_id
+                             ? wmem_strdup(wmem_file_scope(), scan.domain_id)
+                             : NULL;
         ti2->point_count     = walk_ctx.point_index;
         ti2->points_valid    = walk_ctx.points_valid;
         ti2->points_held     = walk_ctx.points_held;
