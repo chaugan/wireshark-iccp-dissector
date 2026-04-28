@@ -60,6 +60,7 @@
 #include <epan/uat.h>
 #include <epan/proto_data.h>
 #include <epan/dissectors/packet-ber.h>
+#include <epan/epan_dissect.h>
 
 /* uat_add_record is exported from libwireshark but its prototype lives
  * in epan/uat-int.h which plugins should not depend on. Declare it
@@ -70,6 +71,15 @@ extern void *uat_add_record(uat_t *uat, const void *orig_rec_ptr, bool valid_rec
  * de-duplicate when a frame would otherwise hit both the OID-level
  * wrapper (during dissection) and the post-dissector (after dissection). */
 #define ICCP_PFRAME_DONE_KEY 0xCAFEBABEu
+
+/* Per-frame "tap already queued" flag key. Distinct from PFRAME_DONE_KEY
+ * because dissect_iccp can run (and add proto-tree subtrees) without
+ * having queued the iccp tap -- the tap-queue happens via the always-on
+ * "frame" tap listener iccp_force_tree_packet, which sees edt->tree
+ * after Wireshark's stats retap path stabilises. The flag prevents the
+ * dissector path AND the listener path from both queueing the same
+ * frame (which would double every count axis). */
+#define ICCP_TAP_QUEUED_KEY  0xCAFEBABFu
 
 /* Set at handoff. NULL if MMS isn't loaded into Wireshark (very rare). */
 static dissector_handle_t mms_handle = NULL;
@@ -845,6 +855,14 @@ typedef struct {
      * still get the aggregate min/max/sum on the tap). */
     wmem_array_t *point_values;       /* gfloat per element */
     wmem_array_t *point_validities;   /* guint8 per element, 0..3 */
+    /* When TRUE, the walker collects counters and per-point arrays but
+     * does NOT mutate the proto tree (no [Decoded float], no [Quality
+     * decoded], no Point #N synthesis rows). Used by the always-on
+     * "frame" tap listener which re-runs the analysis on edt->tree
+     * AFTER the dissector pass added those items: a second pass that
+     * re-added them would duplicate every Point #N row in the GUI
+     * detail pane. */
+    gboolean read_only;
 } iccp_walk_ctx_t;
 
 static void attach_decoded_values(proto_node *node, gpointer user_data);
@@ -925,28 +943,34 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
 
     /* Promote the structure_element to a subtree (it usually already
      * is one, but proto_item_add_subtree is idempotent for our
-     * ett_iccp_point on a fresh node) and add the synthesis row. */
-    proto_tree *sub = proto_item_add_subtree(node, ett_iccp_point);
-    proto_item *pit = proto_tree_add_string(sub, hf_iccp_point_summary,
-                                            fp_fi->ds_tvb,
-                                            fp_fi->start,
-                                            (bs_fi->start + bs_fi->length)
-                                              - fp_fi->start,
-                                            line);
-    proto_item_set_generated(pit);
-    proto_tree *psub = proto_item_add_subtree(pit, ett_iccp_point);
-    proto_item *vi = proto_tree_add_float(psub, hf_iccp_point_value,
-                                          fp_fi->ds_tvb, fp_fi->start,
-                                          fp_fi->length, v);
-    proto_item_set_generated(vi);
-    proto_item *qi = proto_tree_add_string(psub, hf_iccp_point_quality,
-                                           bs_fi->ds_tvb, bs_fi->start,
-                                           bs_fi->length, qbuf);
-    proto_item_set_generated(qi);
-    proto_item *ii = proto_tree_add_uint(psub, hf_iccp_point_index,
-                                         fp_fi->ds_tvb, fp_fi->start, 0,
-                                         ctx->point_index - 1);
-    proto_item_set_generated(ii);
+     * ett_iccp_point on a fresh node) and add the synthesis row.
+     * Skipped in read_only mode -- the listener path runs the same
+     * walker AFTER the dissector pass already added these rows, and
+     * adding them a second time would duplicate Point #N entries
+     * in the GUI detail pane. */
+    if (!ctx->read_only) {
+        proto_tree *sub = proto_item_add_subtree(node, ett_iccp_point);
+        proto_item *pit = proto_tree_add_string(sub, hf_iccp_point_summary,
+                                                fp_fi->ds_tvb,
+                                                fp_fi->start,
+                                                (bs_fi->start + bs_fi->length)
+                                                  - fp_fi->start,
+                                                line);
+        proto_item_set_generated(pit);
+        proto_tree *psub = proto_item_add_subtree(pit, ett_iccp_point);
+        proto_item *vi = proto_tree_add_float(psub, hf_iccp_point_value,
+                                              fp_fi->ds_tvb, fp_fi->start,
+                                              fp_fi->length, v);
+        proto_item_set_generated(vi);
+        proto_item *qi = proto_tree_add_string(psub, hf_iccp_point_quality,
+                                               bs_fi->ds_tvb, bs_fi->start,
+                                               bs_fi->length, qbuf);
+        proto_item_set_generated(qi);
+        proto_item *ii = proto_tree_add_uint(psub, hf_iccp_point_index,
+                                             fp_fi->ds_tvb, fp_fi->start, 0,
+                                             ctx->point_index - 1);
+        proto_item_set_generated(ii);
+    }
 
     /* Roll the synthesised point into the per-PDU aggregates so the
      * post-dissector can forward them to the tap (Tier 3 stats). */
@@ -1041,11 +1065,97 @@ attach_decoded_values(proto_node *node, gpointer user_data)
     if (!node) return;
     iccp_walk_ctx_t *ctx = (iccp_walk_ctx_t *)user_data;
 
-    maybe_decode_float(node);
-    maybe_decode_quality(node);
+    /* Tree mutators (decoded float, quality bit-string decode, point
+     * synthesis subtree) only fire on the dissector pass. In read_only
+     * mode the listener re-runs the walk solely to populate per-point
+     * counters and arrays for tap delivery; the dissector already
+     * emitted the GUI items. */
+    if (!ctx || !ctx->read_only) {
+        maybe_decode_float(node);
+        maybe_decode_quality(node);
+    }
     if (ctx) maybe_synthesise_point(node, ctx);
 
     proto_tree_children_foreach(node, attach_decoded_values, ctx);
+}
+
+/* Build and queue the tap_info for the iccp tap. Idempotent per frame:
+ * uses ICCP_TAP_QUEUED_KEY in the per-packet proto-data store so the
+ * dissector path (called during PRES OID dispatch or as post-dissector)
+ * AND the always-on tap listener iccp_force_tree_packet (called after
+ * dissection on edt->tree) can both invoke this without double-queueing.
+ *
+ * Allocation strategy: the iccp_tap_info_t and its volatile string
+ * fields (object_name, set_name, domain_id) live in wmem_file_scope so
+ * the GUI Statistics dialog's tap-replay path -- which can read cached
+ * tap data after pinfo->pool has been freed -- never sees dangling
+ * pointers. iccp_op_str / scan->matched->category / iccp_scope_str /
+ * dev_sub / dev->name are either string literals or already in
+ * wmem_file_scope and don't need duplicating. */
+static void
+iccp_emit_tap(packet_info *pinfo,
+              iccp_op_t op,
+              iccp_conv_t *info,
+              const iccp_name_scan_t *scan,
+              iccp_device_entry_t *dev,
+              const char *dev_sub,
+              const iccp_pdu_flags_t *flags,
+              const iccp_walk_ctx_t *walk_ctx)
+{
+    if (p_get_proto_data(pinfo->pool, pinfo, proto_iccp, ICCP_TAP_QUEUED_KEY))
+        return;
+    if (!have_tap_listener(proto_iccp_tap))
+        return;
+
+    iccp_tap_info_t *ti2 = wmem_new0(wmem_file_scope(), iccp_tap_info_t);
+    ti2->op           = (int)op;
+    ti2->op_str       = iccp_op_str(op);
+    ti2->assoc_state  = (int)info->state;
+    if (scan->matched) {
+        ti2->cb              = scan->matched->cb;
+        ti2->object_category = scan->matched->category;
+        ti2->object_name     = scan->matched_name
+                             ? wmem_strdup(wmem_file_scope(), scan->matched_name)
+                             : NULL;
+    }
+    if (dev) {
+        ti2->device_name  = dev->name;
+        ti2->device_state = (int)dev->state;
+        ti2->device_sub   = dev_sub;
+    }
+    if (flags->access_result_count > 0
+        && (op == ICCP_OP_INFORMATION_REPORT
+         || op == ICCP_OP_READ_RESP
+         || op == ICCP_OP_WRITE_RESP)) {
+        ti2->report_points     = flags->access_result_count;
+        ti2->report_failure    = flags->failure_count;
+        ti2->report_success    = (flags->failure_count <= flags->access_result_count)
+                               ? (flags->access_result_count - flags->failure_count) : 0;
+        ti2->report_structured = (flags->structure_count > 0);
+    }
+    {
+        const char *raw_set = scan->matched_name ? scan->matched_name : scan->first_name;
+        ti2->set_name = raw_set ? wmem_strdup(wmem_file_scope(), raw_set) : NULL;
+    }
+    ti2->scope     = iccp_scope_str(scan->scope);
+    ti2->domain_id = scan->domain_id
+                   ? wmem_strdup(wmem_file_scope(), scan->domain_id)
+                   : NULL;
+    ti2->point_count       = walk_ctx->point_index;
+    ti2->points_valid      = walk_ctx->points_valid;
+    ti2->points_held       = walk_ctx->points_held;
+    ti2->points_suspect    = walk_ctx->points_suspect;
+    ti2->points_notvalid   = walk_ctx->points_notvalid;
+    ti2->point_value_min   = walk_ctx->v_min;
+    ti2->point_value_max   = walk_ctx->v_max;
+    ti2->point_value_sum   = walk_ctx->v_sum;
+    ti2->has_point_values  = walk_ctx->has_value;
+    ti2->point_values_arr     = walk_ctx->point_values;
+    ti2->point_validities_arr = walk_ctx->point_validities;
+
+    tap_queue_packet(proto_iccp_tap, pinfo, ti2);
+    p_add_proto_data(pinfo->pool, pinfo, proto_iccp,
+                     ICCP_TAP_QUEUED_KEY, GINT_TO_POINTER(1));
 }
 
 /* OID-level wrapper around the MMS dissector.
@@ -1405,88 +1515,10 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
         }
     }
 
-    /* Queue tap_info for any listener (stats_tree, custom tap, Lua tap)
-     * interested in ICCP packet attributes. Packet-scope allocation:
-     * listeners must copy anything they want to keep. */
-    if (have_tap_listener(proto_iccp_tap)) {
-        /* Allocate the tap-info struct in wmem_file_scope rather than
-         * pinfo->pool. Wireshark's GUI stats listener replays cached
-         * tap data on retap and on dialog re-open without re-running
-         * dissection in some flows; pinfo->pool is freed at end of
-         * each packet's dissection, so tap_info structs allocated
-         * there end up dangling -- the unconditional axes (ICCP peers,
-         * PDU sizes, which read from pinfo) still fire but every
-         * conditional axis (Operation, Object category, Conformance
-         * Block, ...) reads NULL/zero from the dangling memory and
-         * silently drops the tick. wmem_file_scope persists for the
-         * file's lifetime so replays always see live data. */
-        iccp_tap_info_t *ti2 = wmem_new0(wmem_file_scope(), iccp_tap_info_t);
-        ti2->op              = (int)op;
-        ti2->op_str          = iccp_op_str(op);                /* string literal */
-        ti2->assoc_state     = (int)info->state;
-        if (scan.matched) {
-            ti2->cb              = scan.matched->cb;
-            ti2->object_category = scan.matched->category;     /* static patterns table */
-            /* scan.matched_name points into MMS dissector's pinfo->pool;
-             * dup into file_scope for replay safety. */
-            ti2->object_name     = scan.matched_name
-                                 ? wmem_strdup(wmem_file_scope(), scan.matched_name)
-                                 : NULL;
-        }
-        if (dev) {
-            ti2->device_name  = dev->name;                     /* already wmem_file_scope */
-            ti2->device_state = (int)dev->state;
-            ti2->device_sub   = dev_sub;                       /* string literal */
-        }
-        if (flags.access_result_count > 0
-            && (op == ICCP_OP_INFORMATION_REPORT
-             || op == ICCP_OP_READ_RESP
-             || op == ICCP_OP_WRITE_RESP)) {
-            ti2->report_points     = flags.access_result_count;
-            ti2->report_failure    = flags.failure_count;
-            ti2->report_success    = (flags.failure_count <= flags.access_result_count)
-                                   ? (flags.access_result_count - flags.failure_count) : 0;
-            ti2->report_structured = (flags.structure_count > 0);
-        }
-
-        /* Tier 3: forward per-point aggregates harvested by the
-         * synthesis walker. set_name comes from the same name scan
-         * that drives column/category labelling -- on captures with
-         * intact ICCP names that's the Transfer-Set / variable list;
-         * on heavily anonymised captures it's NULL and the tap
-         * listener buckets under "(unnamed)". */
-        /* Prefer this PDU's matched name; if no TASE.2 reserved pattern
-         * matched, fall back to the first variable identifier seen on
-         * the wire. Without this fallback, every EXAMPLE_UTIL_A-internal
-         * (or other vendor-specific) name buckets under "(unnamed)"
-         * in the per-set stats tree. */
-        /* set_name and domain_id come from MMS pinfo->pool; dup into
-         * file_scope for replay safety (see ti2 allocation comment). */
-        {
-            const char *raw_set = scan.matched_name ? scan.matched_name : scan.first_name;
-            ti2->set_name = raw_set ? wmem_strdup(wmem_file_scope(), raw_set) : NULL;
-        }
-        ti2->scope           = iccp_scope_str(scan.scope);     /* string literal */
-        ti2->domain_id       = scan.domain_id
-                             ? wmem_strdup(wmem_file_scope(), scan.domain_id)
-                             : NULL;
-        ti2->point_count     = walk_ctx.point_index;
-        ti2->points_valid    = walk_ctx.points_valid;
-        ti2->points_held     = walk_ctx.points_held;
-        ti2->points_suspect  = walk_ctx.points_suspect;
-        ti2->points_notvalid = walk_ctx.points_notvalid;
-        ti2->point_value_min = walk_ctx.v_min;
-        ti2->point_value_max = walk_ctx.v_max;
-        ti2->point_value_sum = walk_ctx.v_sum;
-        ti2->has_point_values = walk_ctx.has_value;
-        /* Per-point arrays for STAT_DT_FLOAT axes. Live for the
-         * duration of pinfo->pool, which lasts past tap_queue_packet
-         * into the listener invocations. */
-        ti2->point_values_arr     = walk_ctx.point_values;
-        ti2->point_validities_arr = walk_ctx.point_validities;
-
-        tap_queue_packet(proto_iccp_tap, pinfo, ti2);
-    }
+    /* Queue the tap. iccp_emit_tap is idempotent per frame (de-duped
+     * via ICCP_TAP_QUEUED_KEY) so the dissector path AND the always-on
+     * listener path can both call it; whichever fires first wins. */
+    iccp_emit_tap(pinfo, op, info, &scan, dev, dev_sub, &flags, &walk_ctx);
 
     /* Return captured length, not 0. A post-dissector that returns 0
      * is treated as "didn't claim this packet" -- Wireshark then
@@ -1990,13 +2022,129 @@ proto_register_iccp(void)
                                NULL);
 }
 
-/* No-op tap callback: just exists to carry TL_REQUIRES_PROTO_TREE. */
+/* Always-on tap listener that doubles as our authoritative analysis
+ * pass for the GUI Statistics dialog.
+ *
+ * Why this exists in addition to dissect_iccp:
+ * The Wireshark GUI Stats dialog has, across multiple version-specific
+ * code paths in 4.2.x, been observed to call our stats tree's tap
+ * callback against tap data that was queued from the dissector path
+ * but which lost (NULL'd) its conditional fields by the time the GUI
+ * rendered it. Symptom: only ICCP peers, PDU sizes, and the sticky
+ * Association state populate; Operation, Object category, Conformance
+ * Block, Transfer Sets, Point values, etc. all read zero. Same data,
+ * same DLL, same version: tshark CLI gives byte-identical fully
+ * populated stats; the GUI doesn't. None of the registration / flag
+ * combinations we tried (TL_REQUIRES_PROTO_TREE on stats listener and
+ * on iccp tap, find_dissector_add_dependency, wmem_file_scope on
+ * tap_info, OID-level wrapping dissector) closed the gap.
+ *
+ * What this listener does: walks edt->tree (the proto tree as it
+ * stands AFTER the entire dispatch pass completes -- guaranteed by
+ * TL_REQUIRES_PROTO_TREE on this listener), runs the same analysis
+ * the dissector does, and queues the iccp tap. iccp_emit_tap is
+ * idempotent per frame so the dissector path's earlier queue (if it
+ * succeeded) wins; otherwise this path fills in. The listener uses
+ * walk_ctx.read_only=TRUE so no proto tree items get duplicated.
+ *
+ * The "frame" tap fires once per dissected packet with the proto
+ * tree fully built, both during initial dissection and on every
+ * retap (because the listener has TL_REQUIRES_PROTO_TREE), so this
+ * path covers every code path the GUI takes. */
 static tap_packet_status
-iccp_force_tree_packet(void *tapdata _U_, packet_info *pinfo _U_,
-                       epan_dissect_t *edt _U_, const void *p _U_,
+iccp_force_tree_packet(void *tapdata _U_, packet_info *pinfo,
+                       epan_dissect_t *edt, const void *p _U_,
                        tap_flags_t flags _U_)
 {
-    return TAP_PACKET_DONT_REDRAW;
+    if (!edt || !edt->tree) return TAP_PACKET_DONT_REDRAW;
+    if (!proto_is_frame_protocol(pinfo->layers, "mms"))
+        return TAP_PACKET_DONT_REDRAW;
+    if (p_get_proto_data(pinfo->pool, pinfo, proto_iccp, ICCP_TAP_QUEUED_KEY))
+        return TAP_PACKET_DONT_REDRAW;
+    if (!have_tap_listener(proto_iccp_tap))
+        return TAP_PACKET_DONT_REDRAW;
+
+    proto_tree *tree = edt->tree;
+
+    iccp_pdu_flags_t local_flags;
+    iccp_name_scan_t scan;
+    walk_tree(pinfo, tree, &local_flags, &scan);
+
+    iccp_walk_ctx_t walk_ctx = { 0 };
+    walk_ctx.read_only        = TRUE;
+    walk_ctx.point_values     = wmem_array_new(wmem_file_scope(), sizeof(gfloat));
+    walk_ctx.point_validities = wmem_array_new(wmem_file_scope(), sizeof(guint8));
+    if (local_flags.floating_point_count > 0
+        || local_flags.bit_string_count   > 0
+        || local_flags.structure_count    > 0) {
+        proto_tree_children_foreach(tree, attach_decoded_values, &walk_ctx);
+    }
+
+    iccp_op_t op = classify_operation(&local_flags);
+    iccp_conv_t *info = iccp_conv_get(pinfo, TRUE);
+
+    /* State machine -- idempotent: the dissector pass already ran
+     * this exact code, but if dissect_iccp's walk found nothing on
+     * this packet (the GUI-retap symptom this listener is here to
+     * fix) the state is whatever the dissector left it. Re-running
+     * with the listener's fuller walk gives correct state advances.
+     * Confirmed-state and Candidate transitions are monotone, so
+     * no second-application damage. */
+    if (op == ICCP_OP_ASSOC_REQ || op == ICCP_OP_ASSOC_RESP) {
+        if (info->state == ICCP_ASSOC_NONE) {
+            info->state = ICCP_ASSOC_CANDIDATE;
+            info->initiate_frame = pinfo->num;
+        }
+    }
+    if (scan.matched && info->state != ICCP_ASSOC_CONFIRMED) {
+        info->state = ICCP_ASSOC_CONFIRMED;
+        info->confirmed_frame = pinfo->num;
+        g_strlcpy(info->confirmation_name, scan.matched_name,
+                  sizeof info->confirmation_name);
+        info->confirmation_cb = scan.matched->cb;
+    }
+
+    /* Device state machine. Same idempotency reasoning. */
+    iccp_device_entry_t *dev     = NULL;
+    const char          *dev_sub = NULL;
+    if (scan.matched && scan.matched->cb == 5 && scan.matched_name) {
+        dev_sub = iccp_device_subop(scan.matched_name);
+        if (dev_sub) {
+            char base[64];
+            iccp_device_base_name(scan.matched_name, base, sizeof base);
+            dev = iccp_device_lookup(pinfo, base, TRUE);
+            if (dev) {
+                conversation_t *conv = find_conversation_pinfo(pinfo, 0);
+                guint32 conv_idx = conv ? conv->conv_index : 0;
+                if (strcmp(dev_sub, "Select") == 0) {
+                    dev->state             = ICCP_DEV_SELECTED;
+                    dev->select_frame      = pinfo->num;
+                    dev->select_conv_index = conv_idx;
+                } else if (strcmp(dev_sub, "SBO-Operate") == 0) {
+                    dev->state = ICCP_DEV_OPERATED;
+                } else if (strcmp(dev_sub, "Cancel") == 0) {
+                    dev->state = ICCP_DEV_IDLE;
+                }
+            }
+        }
+    }
+
+    /* Surface gate -- same as dissect_iccp's. */
+    gboolean surface =
+        info->state == ICCP_ASSOC_CONFIRMED
+        || op == ICCP_OP_ASSOC_REQ
+        || op == ICCP_OP_ASSOC_RESP
+        || op == ICCP_OP_CONCLUDE_REQ
+        || op == ICCP_OP_CONCLUDE_RESP
+        || op == ICCP_OP_INFORMATION_REPORT
+        || op == ICCP_OP_READ_RESP
+        || op == ICCP_OP_WRITE_RESP
+        || scan.matched != NULL;
+    if (!surface)
+        return TAP_PACKET_DONT_REDRAW;
+
+    iccp_emit_tap(pinfo, op, info, &scan, dev, dev_sub, &local_flags, &walk_ctx);
+    return TAP_PACKET_REDRAW;
 }
 
 /* Auto-inject the canonical ICCP / TASE.2 PRES context binding.
