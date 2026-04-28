@@ -54,3 +54,6 @@ desktop.ini
 pcaps/public/
 pcaps/local/
 pcaps/mms-fields.tsv
+
+# Handover notes for cross-LLM-session context (local only)
+HANDOVER.md
