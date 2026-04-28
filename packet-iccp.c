@@ -1975,8 +1975,16 @@ proto_register_iccp(void)
     /* Third arg is the abbrev. Wireshark auto-appends ",tree" when
      * listing -z options, so passing "iccp" yields "iccp,tree" on the
      * command line. */
+    /* TL_REQUIRES_PROTO_TREE forces Wireshark to RE-DISSECT each
+     * packet on every stats retap (dialog open, Apply, Reload). Without
+     * this, retap replays cached tap data without rebuilding the proto
+     * tree -- our analysis runs at dissection time, so a replay sees
+     * no fresh tap_queue calls and the conditional axes show empty
+     * (only the unconditional ICCP-peers and PDU-sizes ones tick from
+     * pinfo). With it, every retap re-runs the wrapper, MMS, and our
+     * analysis, and stats populate identically every time. */
     stats_tree_register_plugin("iccp", "iccp", "ICCP/Statistics",
-                               0,
+                               TL_REQUIRES_PROTO_TREE,
                                iccp_stats_tree_packet,
                                iccp_stats_tree_init,
                                NULL);
