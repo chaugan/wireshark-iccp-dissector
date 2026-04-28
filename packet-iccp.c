@@ -56,6 +56,7 @@
 #include <epan/tap.h>
 #include <epan/stats_tree.h>
 #include <wsutil/wmem/wmem_map.h>
+#include <wsutil/wmem/wmem_array.h>
 
 #include <string.h>
 
@@ -143,12 +144,22 @@ static int st_node_blocks     = -1;
 static int st_node_assocs     = -1;
 static int st_node_devices    = -1;
 static int st_node_reports    = -1;
-static int st_node_points_set    = -1;  /* Tier 3: pivot per Transfer-Set */
-static int st_node_points_qual   = -1;  /* Tier 3: validity-class breakdown */
-static int st_node_points_range  = -1;  /* Tier 3: value range buckets */
-static int st_node_points_dist   = -1;  /* Tier 3: numeric value distribution (avg/min/max) */
-static int st_node_peers         = -1;  /* Tier 5: per src->dst peer pivot */
-static int st_node_scope         = -1;  /* TASE.2 name scope (VCC vs Bilateral) */
+static int st_node_points_set    = -1;  /* Tier 3: pivot per Transfer-Set (count) */
+static int st_node_points_qual   = -1;  /* Tier 3: validity-class breakdown (count) */
+static int st_node_points_range  = -1;  /* Tier 3: value range buckets (count) */
+static int st_node_peers         = -1;  /* Tier 5: per src->dst peer pivot (count) */
+static int st_node_scope         = -1;  /* TASE.2 name scope (VCC vs Bilateral) (count) */
+/* Tier 4 axes -- STAT_DT_FLOAT, populate the Average/Min/Max columns
+ * in the Wireshark stats dialog. Built per-point or per-PDU value
+ * distributions on top of the same iccp_tap_info_t the count axes use. */
+static int st_node_pvalues          = -1;  /* per-point: every numeric value */
+static int st_node_pvalues_qual     = -1;  /* per-point: by validity class */
+static int st_node_pvalues_set      = -1;  /* per-point: by Transfer Set */
+static int st_node_pvalues_cb       = -1;  /* per-point: by Conformance Block */
+static int st_node_points_per_pdu   = -1;  /* per-PDU:  point_count distribution */
+static int st_node_success_ratio    = -1;  /* per-PDU:  AccessResult success ratio */
+static int st_node_quality_mix      = -1;  /* per-PDU:  validity-class fractions */
+static int st_node_pdu_sizes        = -1;  /* per-PDU:  frame length, with per-Op breakdown */
 
 /* Tap payload: everything a listener (stats_tree, custom Lua tap, an
  * external analysis) might reasonably want to know about a single ICCP
@@ -191,6 +202,13 @@ typedef struct {
     gfloat         point_value_max;
     gfloat         point_value_sum;
     gboolean       has_point_values;
+    /* Per-point detail for STAT_DT_FLOAT axes. Same allocation pool as
+     * the surrounding tap_info, valid only inside the tap-listener call
+     * (listeners that retain it across packets must copy). NULL if no
+     * points were synthesised. point_validities[i] is in 0..3 mapping
+     * to VALID/HELD/SUSPECT/NOT_VALID. */
+    wmem_array_t  *point_values_arr;
+    wmem_array_t  *point_validities_arr;
 } iccp_tap_info_t;
 
 /* We do not cache MMS hf indices: walk_tree() matches fields by
@@ -778,6 +796,13 @@ typedef struct {
     gfloat   v_max;
     gfloat   v_sum;
     gboolean has_value;
+    /* Optional per-point capture for STAT_DT_FLOAT stats axes. Set up
+     * by the caller using pinfo->pool; maybe_synthesise_point appends
+     * one (value, validity_class) pair per recognised IndicationPoint.
+     * NULL means "skip per-point capture" (the stats listener will
+     * still get the aggregate min/max/sum on the tap). */
+    wmem_array_t *point_values;       /* gfloat per element */
+    wmem_array_t *point_validities;   /* guint8 per element, 0..3 */
 } iccp_walk_ctx_t;
 
 static void attach_decoded_values(proto_node *node, gpointer user_data);
@@ -883,7 +908,8 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
 
     /* Roll the synthesised point into the per-PDU aggregates so the
      * post-dissector can forward them to the tap (Tier 3 stats). */
-    switch ((q & ICCP_Q_VALIDITY_MASK) >> 6) {
+    guint8 vc = (guint8)((q & ICCP_Q_VALIDITY_MASK) >> 6);
+    switch (vc) {
         case 0: ctx->points_valid++;    break;
         case 1: ctx->points_held++;     break;
         case 2: ctx->points_suspect++;  break;
@@ -893,6 +919,17 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
     if (!ctx->has_value || v > ctx->v_max) ctx->v_max = v;
     ctx->v_sum    += v;
     ctx->has_value = TRUE;
+
+    /* Per-point detail for STAT_DT_FLOAT stats axes. Allocated upstream
+     * from pinfo->pool; the listener iterates these in lock-step so a
+     * mismatch between the two arrays would silently drop validity
+     * information (kept consistent here by appending both unconditionally). */
+    if (ctx->point_values) {
+        wmem_array_append_one(ctx->point_values, v);
+    }
+    if (ctx->point_validities) {
+        wmem_array_append_one(ctx->point_validities, vc);
+    }
 }
 
 /* If `node` is an mms.data_bit-string of length 1, treat it as a
@@ -991,6 +1028,8 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
      * Done unconditionally on every MMS-bearing packet, so this
      * works on heavily anonymized captures too. */
     iccp_walk_ctx_t walk_ctx = { 0 };
+    walk_ctx.point_values     = wmem_array_new(pinfo->pool, sizeof(gfloat));
+    walk_ctx.point_validities = wmem_array_new(pinfo->pool, sizeof(guint8));
     if (flags.floating_point_count > 0
         || flags.bit_string_count   > 0
         || flags.structure_count    > 0) {
@@ -1310,6 +1349,11 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
         ti2->point_value_max = walk_ctx.v_max;
         ti2->point_value_sum = walk_ctx.v_sum;
         ti2->has_point_values = walk_ctx.has_value;
+        /* Per-point arrays for STAT_DT_FLOAT axes. Live for the
+         * duration of pinfo->pool, which lasts past tap_queue_packet
+         * into the listener invocations. */
+        ti2->point_values_arr     = walk_ctx.point_values;
+        ti2->point_validities_arr = walk_ctx.point_validities;
 
         tap_queue_packet(proto_iccp_tap, pinfo, ti2);
     }
@@ -1357,6 +1401,20 @@ iccp_stats_tree_init(stats_tree *st)
      * peer-pair. Bilateral writes (especially Device_*) are the
      * security-sensitive operations. */
     st_node_scope        = stats_tree_create_node(st, "Operations by scope",     0, STAT_DT_INT, TRUE);
+
+    /* Tier 4: STAT_DT_FLOAT axes. Each tick records a numeric value
+     * (point value, point count, ratio, percentage, frame length) so
+     * the Wireshark dialog populates the Average / Min Val / Max Val
+     * columns alongside Count and Percent. STAT_DT_INT axes above stay
+     * count-only by design. */
+    st_node_pvalues        = stats_tree_create_node(st, "Point values (all numeric points)",   0, STAT_DT_FLOAT, FALSE);
+    st_node_pvalues_qual   = stats_tree_create_node(st, "Point values by validity",            0, STAT_DT_FLOAT, TRUE);
+    st_node_pvalues_set    = stats_tree_create_node(st, "Point values by Transfer Set",        0, STAT_DT_FLOAT, TRUE);
+    st_node_pvalues_cb     = stats_tree_create_node(st, "Point values by Conformance Block",   0, STAT_DT_FLOAT, TRUE);
+    st_node_points_per_pdu = stats_tree_create_node(st, "Points per PDU",                       0, STAT_DT_FLOAT, FALSE);
+    st_node_success_ratio  = stats_tree_create_node(st, "Report success ratio per PDU",         0, STAT_DT_FLOAT, FALSE);
+    st_node_quality_mix    = stats_tree_create_node(st, "Quality mix per PDU (%)",              0, STAT_DT_FLOAT, TRUE);
+    st_node_pdu_sizes      = stats_tree_create_node(st, "PDU sizes (bytes)",                    0, STAT_DT_FLOAT, TRUE);
 }
 
 static tap_packet_status
@@ -1471,6 +1529,83 @@ iccp_stats_tree_packet(stats_tree *st,
     if (ti->scope) {
         tick_stat_node(st, "Operations by scope", 0, TRUE);
         tick_stat_node(st, ti->scope, st_node_scope, FALSE);
+    }
+
+    /* -- Tier 4: STAT_DT_FLOAT axes (Average / Min Val / Max Val). -- */
+
+    /* Per-point value distributions. avg_stat_node_add_value_float
+     * accumulates count + sum + min + max in the named node; calling
+     * it on the parent ("by validity" / "by Transfer Set" / "by
+     * Conformance Block") gives the cumulative distribution across
+     * children, calling it on the child gives the per-bucket
+     * distribution. The "Point values" leaf has no children -- it's
+     * the global per-point distribution. */
+    if (ti->point_values_arr && ti->point_validities_arr) {
+        const guint n_v = wmem_array_get_count(ti->point_values_arr);
+        const guint n_q = wmem_array_get_count(ti->point_validities_arr);
+        const guint n   = (n_v < n_q) ? n_v : n_q;
+        if (n > 0) {
+            const char *set = (ti->set_name && *ti->set_name) ? ti->set_name : "(unnamed)";
+            char cb_label[24];
+            if (ti->cb > 0) g_snprintf(cb_label, sizeof cb_label, "Block %u", ti->cb);
+            else            g_strlcpy(cb_label, "Unclassified", sizeof cb_label);
+
+            for (guint i = 0; i < n; i++) {
+                const gfloat v  = *(gfloat *)wmem_array_index(ti->point_values_arr, i);
+                const guint8 vc = *(guint8 *)wmem_array_index(ti->point_validities_arr, i);
+                const char  *vname = (vc == 0) ? "VALID" :
+                                     (vc == 1) ? "HELD"  :
+                                     (vc == 2) ? "SUSPECT" : "NOT_VALID";
+
+                /* Global per-point value distribution. */
+                avg_stat_node_add_value_float(st, "Point values (all numeric points)", 0, FALSE, v);
+
+                /* By validity class -- parent + child. */
+                avg_stat_node_add_value_float(st, "Point values by validity", 0,                    TRUE,  v);
+                avg_stat_node_add_value_float(st, vname,                      st_node_pvalues_qual, FALSE, v);
+
+                /* By Transfer Set name. */
+                avg_stat_node_add_value_float(st, "Point values by Transfer Set", 0,                   TRUE,  v);
+                avg_stat_node_add_value_float(st, set,                            st_node_pvalues_set, FALSE, v);
+
+                /* By Conformance Block. */
+                avg_stat_node_add_value_float(st, "Point values by Conformance Block", 0,                  TRUE,  v);
+                avg_stat_node_add_value_float(st, cb_label,                            st_node_pvalues_cb, FALSE, v);
+            }
+        }
+    }
+
+    /* Per-PDU shape distributions. Only meaningful for PDUs that
+     * actually carry AccessResults (InformationReport / Read-Response
+     * / Write-Response). */
+    if (ti->report_points > 0) {
+        avg_stat_node_add_value_float(st, "Points per PDU", 0, FALSE, (gfloat)ti->point_count);
+
+        const gfloat ratio = (gfloat)ti->report_success / (gfloat)ti->report_points;
+        avg_stat_node_add_value_float(st, "Report success ratio per PDU", 0, FALSE, ratio);
+    }
+
+    /* Per-PDU quality mix as percentages. Same parent for all four so
+     * the dialog shows a stacked picture of how the per-class mix
+     * varies PDU to PDU (look at Average for the typical mix and
+     * Max Val to spot worst-case SUSPECT bursts). */
+    if (ti->point_count > 0) {
+        const gfloat total = (gfloat)ti->point_count;
+        avg_stat_node_add_value_float(st, "Quality mix per PDU (%)", 0,                  TRUE,  100.0f);
+        avg_stat_node_add_value_float(st, "VALID%",     st_node_quality_mix, FALSE, 100.0f * (gfloat)ti->points_valid    / total);
+        avg_stat_node_add_value_float(st, "HELD%",      st_node_quality_mix, FALSE, 100.0f * (gfloat)ti->points_held     / total);
+        avg_stat_node_add_value_float(st, "SUSPECT%",   st_node_quality_mix, FALSE, 100.0f * (gfloat)ti->points_suspect  / total);
+        avg_stat_node_add_value_float(st, "NOT_VALID%", st_node_quality_mix, FALSE, 100.0f * (gfloat)ti->points_notvalid / total);
+    }
+
+    /* PDU sizes, with per-Operation breakdown. Useful for capacity
+     * planning ("how big is a typical InformationReport?") and for
+     * spotting outliers ("a 4 KB Read-Request is suspicious"). */
+    {
+        const gfloat sz = (gfloat)pinfo->fd->pkt_len;
+        avg_stat_node_add_value_float(st, "PDU sizes (bytes)", 0, TRUE, sz);
+        if (ti->op_str && *ti->op_str)
+            avg_stat_node_add_value_float(st, ti->op_str, st_node_pdu_sizes, FALSE, sz);
     }
 
     return TAP_PACKET_REDRAW;
