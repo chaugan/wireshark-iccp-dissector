@@ -14,8 +14,8 @@ import struct
 import sys
 from pathlib import Path
 
-PCAP = Path(sys.argv[1] if len(sys.argv) > 1
-            else r'C:\Users\chris\Downloads\iccp_anon.pcap')
+DEFAULT_PCAP = Path(__file__).resolve().parent.parent / 'pcaps' / 'generated' / 'iccp-phase1.pcap'
+PCAP = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PCAP
 
 raw = PCAP.read_bytes()
 endian = '<' if raw[:4] == b'\xa1\xb2\xc3\xd4' else '>'

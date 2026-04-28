@@ -178,23 +178,25 @@ cmake --build . -j"$(nproc)"
 sudo cmake --install . --prefix /usr/local
 sudo cmake --install . --prefix /usr/local --component Development
 # now rebuild our plugin against /usr/local
-cd ~/build/wireshark_iccp
-cmake /path/to/wireshark_iccp -DCMAKE_PREFIX_PATH=/usr/local
+cd ~/build/wireshark-iccp-dissector
+cmake /path/to/wireshark-iccp-dissector -DCMAKE_PREFIX_PATH=/usr/local
 cmake --build .
 ```
 
 **Windows**: our build scripts accept a `-Branch` parameter to
-`win-build-wireshark.ps1`. For a 4.6 build:
+`win-build-wireshark.ps1`. Pass each path explicitly (or set the
+`WIRESHARK_*` env vars described in the *Defaults* table below). For a
+4.6 build:
 
 ```powershell
 .\scripts\win-build-wireshark.ps1 `
     -Branch release-4.6 `
-    -SourceDir  C:\dev\wireshark-4.6 `
-    -BuildDir   C:\dev\wsbuild64-4.6 `
-    -InstallDir C:\dev\ws-install-4.6 `
-    -LibsDir    C:\Development\wireshark-x64-libs-4.6
+    -SourceDir  <wireshark-source-4.6> `
+    -BuildDir   <wireshark-build-4.6> `
+    -InstallDir <wireshark-install-4.6> `
+    -LibsDir    <wireshark-libs-4.6>
 
-.\scripts\win-build-plugin.ps1 -WiresharkInstall C:\dev\ws-install-4.6
+.\scripts\win-build-plugin.ps1 -WiresharkInstall <wireshark-install-4.6>
 ```
 
 Note: keep separate directories per version (source, build, install,
@@ -207,8 +209,8 @@ then loads correctly in a 4.6 runtime.
 ```bash
 sudo apt install libwireshark-dev libwiretap-dev libwsutil-dev \
                  wireshark tshark build-essential cmake
-mkdir -p ~/build/wireshark_iccp && cd ~/build/wireshark_iccp
-cmake /path/to/wireshark_iccp
+mkdir -p ~/build/wireshark-iccp-dissector && cd ~/build/wireshark-iccp-dissector
+cmake /path/to/wireshark-iccp-dissector
 cmake --build . -j"$(nproc)"
 # installs to Wireshark's user plugin dir reported in its CMake config:
 cmake --build . --target copy_plugin
@@ -220,13 +222,13 @@ Alternatively copy `iccp.so` manually to
 ## Build (Windows, via WSL) — development loop used for this repo
 
 ```bash
-wsl -d ubuntu -- bash /mnt/c/.../wireshark_iccp/scripts/wsl-build.sh
-wsl -d ubuntu -- bash /mnt/c/.../wireshark_iccp/scripts/wsl-verify.sh
+wsl -d ubuntu -- bash /path/to/wireshark-iccp-dissector/scripts/wsl-build.sh
+wsl -d ubuntu -- bash /path/to/wireshark-iccp-dissector/scripts/wsl-verify.sh
 ```
 
 `scripts/wsl-build.sh` configures + builds and puts `iccp.so` under
-`~/build/wireshark_iccp/`. `wsl-verify.sh` copies it into the WSL
-Wireshark plugin directory and sanity-checks `tshark -G plugins`.
+`~/build/wireshark-iccp-dissector/`. `wsl-verify.sh` copies it into the
+WSL Wireshark plugin directory and sanity-checks `tshark -G plugins`.
 
 The resulting `.so` runs only inside WSL's Linux Wireshark. A Windows
 `.dll` targeting Windows-native Wireshark requires an MSVC toolchain
@@ -242,15 +244,23 @@ Two scripts automate the full path. Assumes you have already installed:
   (this is not the default — add it via the VS Installer's Modify → workloads)
 - CMake, Strawberry Perl, winflexbison, Python 3, Git
 
-Then from a PowerShell prompt in the repo root:
+Then from a PowerShell prompt in the repo root, after setting the
+`WIRESHARK_*` env vars (or passing them as parameters — see the
+*Defaults* table below):
 
 ```powershell
+# One-time per machine: tell the scripts where to build / install.
+$env:WIRESHARK_SRC          = '<wireshark-source>'
+$env:WIRESHARK_BUILD        = '<wireshark-build>'
+$env:WIRESHARK_INSTALL_DIR  = '<wireshark-install>'
+$env:WIRESHARK_LIBS_DIR     = '<wireshark-libs>'
+
 # One-time (~5 min): clone Wireshark 4.2 source, download prebuilt deps,
 # build libwireshark/libwsutil/libwiretap, install headers+libs+cmake config.
 .\scripts\win-build-wireshark.ps1
 
 # Every time you change plugin source (~30 sec): build iccp.dll and
-# install to %APPDATA%\Wireshark\plugins\4.2\epan\
+# install to %APPDATA%\Wireshark\plugins\<X.Y>\epan\
 .\scripts\win-build-plugin.ps1
 ```
 
@@ -276,27 +286,29 @@ modules are needed.
 
 Defaults:
 
-| Path | Contents |
-|------|----------|
-| `C:\dev\wireshark\` | Wireshark 4.2 source (shallow clone) |
-| `C:\dev\wsbuild64\` | Wireshark build tree (contains `run\RelWithDebInfo\tshark.exe`) |
-| `C:\dev\ws-install\` | Wireshark install tree (headers, libs, `WiresharkConfig.cmake`) |
-| `C:\Development\wireshark-x64-libs-4.2\` | Prebuilt Windows deps (glib, gnutls, …) from Wireshark's dev-libs site |
-| `C:\dev\iccp-build\RelWithDebInfo\iccp.dll` | The plugin DLL |
-| `%APPDATA%\Wireshark\plugins\4.2\epan\iccp.dll` | Installed location |
+| Parameter / env var                                   | Contents                                                                                        |
+|-------------------------------------------------------|-------------------------------------------------------------------------------------------------|
+| `-SourceDir`  / `$env:WIRESHARK_SRC`                  | Wireshark source clone (shallow)                                                                |
+| `-BuildDir`   / `$env:WIRESHARK_BUILD`                | Wireshark build tree (contains `run\RelWithDebInfo\tshark.exe`)                                 |
+| `-InstallDir` / `$env:WIRESHARK_INSTALL_DIR`          | Wireshark install tree (headers, libs, `WiresharkConfig.cmake`)                                 |
+| `-LibsDir`    / `$env:WIRESHARK_LIBS_DIR`             | Prebuilt Windows deps (glib, gnutls, …) from Wireshark's dev-libs site                          |
+| `-PluginBuild` (defaults to `<repo>\build\iccp`)      | Plugin build tree producing `<config>\iccp.dll`                                                 |
+| `%APPDATA%\Wireshark\plugins\<X.Y>\epan\iccp.dll`     | Installed location (post-install copy from `win-build-plugin.ps1`, unless `-NoInstall`)         |
 
-Override any of these via parameters, e.g.
+There are no hardcoded path defaults — every script either reads the
+matching env var or requires you to pass the parameter explicitly.
+Example override on the command line:
 `.\scripts\win-build-wireshark.ps1 -SourceDir D:\ws\src -InstallDir D:\ws\install`.
 
 ### Quick verification
 
 The Wireshark source build produces a local `tshark.exe` at
-`C:\dev\wsbuild64\run\RelWithDebInfo\tshark.exe` (version 4.2.15). The
-plugin is ABI-locked to that version, so you can sanity-check without
-installing a separate Wireshark runtime:
+`<wireshark-build>\run\RelWithDebInfo\tshark.exe`. The plugin is
+ABI-locked to that version, so you can sanity-check without installing
+a separate Wireshark runtime:
 
 ```powershell
-$tshark = 'C:\dev\wsbuild64\run\RelWithDebInfo\tshark.exe'
+$tshark = Join-Path $env:WIRESHARK_BUILD 'run\RelWithDebInfo\tshark.exe'
 $pcap   = '.\pcaps\generated\iccp-phase1.pcap'
 & $tshark -G plugins | Select-String iccp
 & $tshark -r $pcap -d tcp.port==10102,tpkt -Y iccp | Select-Object -First 10
@@ -308,8 +320,8 @@ A plugin built against Wireshark 4.2 **does not load** into Wireshark 4.6
 or any other minor version — the ABI is pinned via the `plugin_want_major`
 / `plugin_want_minor` symbols. Options:
 
-- Use the `tshark.exe` from our own `C:\dev\wsbuild64\run\RelWithDebInfo\`
-  build tree (this *is* Wireshark 4.2.15 runtime, GUI-less).
+- Use the `tshark.exe` from your own `<wireshark-build>\run\RelWithDebInfo\`
+  build tree (matches the Wireshark version you cloned, GUI-less).
 - Install a stock Wireshark 4.2.x installer from wireshark.org/download
   side-by-side with any other version, then copy `iccp.dll` into its
   `%APPDATA%\Wireshark\plugins\4.2\epan\`.

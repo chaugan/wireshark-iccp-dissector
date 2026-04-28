@@ -9,7 +9,7 @@
 # CMake config package is discoverable, e.g. via:
 #
 #   cmake -G "Visual Studio 17 2022" -A x64 \
-#         -DCMAKE_PREFIX_PATH=C:/Development/wsbuild64 ..
+#         -DWireshark_DIR=<wireshark-install>/cmake ..
 #
 # After build, `cmake --build . --target copy_plugin` installs the DLL into
 # the plugin directory reported by Wireshark's CMake config package.

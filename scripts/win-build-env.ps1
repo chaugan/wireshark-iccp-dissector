@@ -11,22 +11,26 @@
 # via vcvarsall.bat for sub-commands that need cl.exe directly. The
 # Visual Studio CMake generator handles MSVC discovery automatically.
 
-$wsSrc   = 'C:\dev\wireshark'
-$wsBuild = 'C:\dev\wsbuild64'
-$vcvars  = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat'
+# Resolve from environment so each user sets their own paths. Set
+# WIRESHARK_SRC / WIRESHARK_BUILD / WIRESHARK_VCVARS in your shell or via
+# a profile script before dot-sourcing this file.
+$wsSrc   = if ($env:WIRESHARK_SRC)    { $env:WIRESHARK_SRC }    else { '' }
+$wsBuild = if ($env:WIRESHARK_BUILD)  { $env:WIRESHARK_BUILD }  else { '' }
+$vcvars  = if ($env:WIRESHARK_VCVARS) { $env:WIRESHARK_VCVARS } else { '' }
 
 # Merge machine + user PATH (captures everything installed persistently)
 $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 $userPath    = [Environment]::GetEnvironmentVariable('Path', 'User')
 $env:Path    = "$machinePath;$userPath"
 
-# Add tools that Wireshark's build expects but aren't on default PATH
+# Add tools that Wireshark's build expects but aren't on default PATH.
+# Python paths use $env:LOCALAPPDATA so they resolve per-user.
 $extra = @(
     'C:\Program Files\CMake\bin',
     'C:\Strawberry\perl\bin',
     'C:\Strawberry\c\bin',
-    'C:\Users\chris\AppData\Local\Programs\Python\Python312',
-    'C:\Users\chris\AppData\Local\Programs\Python\Python312\Scripts',
+    "$env:LOCALAPPDATA\Programs\Python\Python312",
+    "$env:LOCALAPPDATA\Programs\Python\Python312\Scripts",
     "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\WinFlexBison.win_flex_bison_Microsoft.Winget.Source_8wekyb3d8bbwe"
 )
 foreach ($p in $extra) {

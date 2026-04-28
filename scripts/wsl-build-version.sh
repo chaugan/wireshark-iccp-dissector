@@ -17,7 +17,7 @@ set -euo pipefail
 BRANCH=${1:?usage: $0 <release-branch, e.g. release-4.4>}
 VER=${BRANCH#release-}
 
-REPO=/mnt/c/Users/chris/OneDrive/Documents/Programming/wireshark_iccp
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC=$HOME/ws-src-$VER
 BLD=$HOME/ws-build-$VER
 INS=$HOME/ws-install-$VER

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Inspect the Block-5 device control packets in the test PCAP.
 set -euo pipefail
-PCAP=/mnt/c/Users/chris/OneDrive/Documents/Programming/wireshark_iccp/pcaps/generated/iccp-phase1.pcap
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PCAP="${PCAP:-$REPO_ROOT/pcaps/generated/iccp-phase1.pcap}"
 
 echo "=== device-categorised packets ==="
 tshark -r "$PCAP" -d tcp.port==10102,tpkt -Y 'iccp.cb == 5' \

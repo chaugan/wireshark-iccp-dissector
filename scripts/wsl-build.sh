@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Configure + build the ICCP plugin inside WSL Ubuntu.
-# Source tree lives on /mnt/c (Windows side); build tree under $HOME to
-# avoid OneDrive sync churn.
+# Source tree resolved from this script's location; build tree under $HOME
+# to avoid OneDrive sync churn when the source is on a /mnt/c clone.
 
 set -euo pipefail
 
-SRC=/mnt/c/Users/chris/OneDrive/Documents/Programming/wireshark_iccp
-BLD="$HOME/build/wireshark_iccp"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BLD="$HOME/build/wireshark-iccp-dissector"
 
 mkdir -p "$BLD"
 cd "$BLD"

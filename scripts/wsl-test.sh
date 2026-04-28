@@ -2,7 +2,8 @@
 # Run the Phase 1 plugin against the generated PCAP and print results.
 set -euo pipefail
 
-PCAP=${1:-/mnt/c/Users/chris/OneDrive/Documents/Programming/wireshark_iccp/pcaps/generated/iccp-phase1.pcap}
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PCAP="${1:-$REPO_ROOT/pcaps/generated/iccp-phase1.pcap}"
 
 if [[ ! -f $PCAP ]]; then
     echo "pcap not found: $PCAP" >&2

@@ -17,8 +17,9 @@ PORT=10102
 BIN=$HOME/src/libiec61850/build/examples
 SERVER=$BIN/server_example_basic_io/server_example_basic_io
 CLIENT=$BIN/mms_utility/mms_utility
-OUTDIR=/mnt/c/Users/chris/OneDrive/Documents/Programming/wireshark_iccp/pcaps/generated
-PCAP=$OUTDIR/iccp-phase1.pcap
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OUTDIR="${OUTDIR:-$REPO_ROOT/pcaps/generated}"
+PCAP="$OUTDIR/iccp-phase1.pcap"
 
 mkdir -p "$OUTDIR"
 rm -f "$PCAP"

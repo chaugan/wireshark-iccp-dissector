@@ -9,7 +9,7 @@
 set -euo pipefail
 TAG=${1:?usage: $0 <tag, e.g. v0.3.0>}
 
-REPO=/mnt/c/Users/chris/OneDrive/Documents/Programming/wireshark_iccp
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST_DIR=$REPO/release/$TAG
 mkdir -p "$DEST_DIR"
 

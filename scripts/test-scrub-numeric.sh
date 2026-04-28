@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-REPO=/mnt/c/Users/chris/OneDrive/Documents/Programming/wireshark_iccp
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INP=/tmp/iccp-wash-input.pcap
 OUT=/tmp/iccp-wash-numeric.pcap
 

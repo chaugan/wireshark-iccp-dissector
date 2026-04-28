@@ -45,12 +45,16 @@ Param(
     [Parameter(ParameterSetName='DevSelfSigned')]
     [switch]$DevSelfSigned,
 
-    [string]$Dll = 'C:\dev\iccp-build\RelWithDebInfo\iccp.dll',
+    [string]$Dll,
 
     [string]$TimestampUrl = 'http://timestamp.digicert.com',
 
     [string]$FileDescription = 'ICCP / TASE.2 Wireshark dissector plugin'
 )
+
+if (-not $Dll) {
+    $Dll = Join-Path (Split-Path -Parent $PSScriptRoot) "build\iccp\RelWithDebInfo\iccp.dll"
+}
 
 if (-not (Test-Path $Dll)) {
     Write-Error "DLL not found: $Dll"
@@ -60,13 +64,12 @@ if (-not (Test-Path $Dll)) {
 # Put signtool on PATH. The VC vars don't always survive across PS
 # sessions, so re-source the dev env.
 . (Join-Path $PSScriptRoot 'win-build-env.ps1') | Out-Null
-$signtool = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe'
-if (-not (Test-Path $signtool)) {
-    # Fallback: search the SDK for any signtool.exe
-    $signtool = (Get-ChildItem -Path 'C:\Program Files (x86)\Windows Kits\10\bin' -Filter 'signtool.exe' -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.DirectoryName -match '\\x64$' } |
-        Select-Object -First 1 -ExpandProperty FullName)
-}
+# Locate signtool.exe under any installed Windows SDK; pick the highest
+# x64 version available.
+$signtool = (Get-ChildItem -Path 'C:\Program Files (x86)\Windows Kits\10\bin' -Filter 'signtool.exe' -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.DirectoryName -match '\\x64$' } |
+    Sort-Object -Property FullName -Descending |
+    Select-Object -First 1 -ExpandProperty FullName)
 if (-not $signtool -or -not (Test-Path $signtool)) {
     Write-Error "signtool.exe not found under Windows SDK"
     exit 1

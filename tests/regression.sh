@@ -6,7 +6,8 @@
 
 set -euo pipefail
 
-PCAP=/mnt/c/Users/chris/OneDrive/Documents/Programming/wireshark_iccp/pcaps/generated/iccp-phase1.pcap
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PCAP="${PCAP:-$REPO_ROOT/pcaps/generated/iccp-phase1.pcap}"
 DECODE=(-d tcp.port==10102,tpkt)
 
 if [[ ! -f $PCAP ]]; then

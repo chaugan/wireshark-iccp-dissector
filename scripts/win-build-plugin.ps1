@@ -1,31 +1,35 @@
 # win-build-plugin.ps1
 #
 # Build the ICCP / TASE.2 Wireshark plugin on Windows against an
-# installed Wireshark 4.2 dev tree. The Wireshark install prefix is
-# either passed as the first argument or picked up from the environment
-# variable WIRESHARK_INSTALL_DIR. Default: C:\dev\ws-install.
+# installed Wireshark dev tree. The Wireshark install prefix is either
+# passed via -WiresharkInstall or picked up from the environment
+# variable WIRESHARK_INSTALL_DIR.
 #
-# Prerequisites (all already installed for this repo's dev loop):
+# Prerequisites:
 #   - Visual Studio 2022 Build Tools with the "Desktop development with
 #     C++" workload (MSVC 14.43+, Windows 11 SDK)
 #   - CMake, Strawberry Perl, winflexbison, Python 3, Git
-#   - A built + installed Wireshark 4.2 dev tree that contains
+#   - A built + installed Wireshark dev tree that contains
 #     WiresharkConfig.cmake (see scripts/win-build-wireshark.ps1)
 #
-# Outputs iccp.dll to C:\dev\iccp-build\RelWithDebInfo\iccp.dll and
+# Outputs iccp.dll under -PluginBuild (defaults to <repo>\build\iccp) and
 # installs it into the user's Wireshark plugin directory
-# %APPDATA%\Wireshark\plugins\4.2\epan\iccp.dll.
+# %APPDATA%\Wireshark\plugins\<X.Y>\epan\iccp.dll (skip with -NoInstall).
 
 [CmdletBinding()]
 Param(
     [string]$WiresharkInstall = $env:WIRESHARK_INSTALL_DIR,
-    [string]$PluginBuild      = 'C:\dev\iccp-build',
+    [string]$PluginBuild,
     [string]$Config           = 'RelWithDebInfo',
     [switch]$NoInstall
 )
 
-if (-not $WiresharkInstall -or $WiresharkInstall -eq '') {
-    $WiresharkInstall = 'C:\dev\ws-install'
+if (-not $WiresharkInstall) {
+    Write-Error "WiresharkInstall not set. Pass -WiresharkInstall <path> or set `$env:WIRESHARK_INSTALL_DIR."
+    exit 2
+}
+if (-not $PluginBuild) {
+    $PluginBuild = Join-Path (Split-Path -Parent $PSScriptRoot) 'build\iccp'
 }
 
 $pluginSrc = Split-Path -Parent $PSScriptRoot

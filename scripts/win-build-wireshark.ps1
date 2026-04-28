@@ -9,7 +9,7 @@
 #   1. Clone (if not already present) wireshark source at release-4.2
 #      branch.
 #   2. Run tools\win-setup.ps1 to download prebuilt dep libraries into
-#      C:\Development\wireshark-x64-libs-4.2.
+#      -LibsDir.
 #   3. CMake-configure a minimal Wireshark build (no Qt GUI, no extra
 #      extcap tools -- we only need libwireshark / libwsutil / libwiretap
 #      and the cmake package).
@@ -22,10 +22,10 @@
 
 [CmdletBinding()]
 Param(
-    [string]$SourceDir  = 'C:\dev\wireshark',
-    [string]$BuildDir   = 'C:\dev\wsbuild64',
-    [string]$InstallDir = 'C:\dev\ws-install',
-    [string]$LibsDir    = 'C:\Development\wireshark-x64-libs-4.2',
+    [string]$SourceDir  = $env:WIRESHARK_SRC,
+    [string]$BuildDir   = $env:WIRESHARK_BUILD,
+    [string]$InstallDir = $env:WIRESHARK_INSTALL_DIR,
+    [string]$LibsDir    = $env:WIRESHARK_LIBS_DIR,
     [string]$Branch     = 'release-4.2',
     [string]$Config     = 'RelWithDebInfo',
 
@@ -38,6 +38,13 @@ Param(
 )
 
 . (Join-Path $PSScriptRoot 'win-build-env.ps1') | Out-Null
+
+foreach ($p in 'SourceDir','BuildDir','InstallDir','LibsDir') {
+    if (-not (Get-Variable -Name $p -ValueOnly)) {
+        Write-Error "Required path '$p' not set. Pass -$p <path> or set the matching WIRESHARK_* environment variable (see win-build-env.ps1)."
+        exit 2
+    }
+}
 
 # 1. Clone source
 if (-not (Test-Path $SourceDir)) {

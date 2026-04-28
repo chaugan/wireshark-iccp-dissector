@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Show per-conformance-block coverage from the test PCAP.
 set -euo pipefail
-PCAP=/mnt/c/Users/chris/OneDrive/Documents/Programming/wireshark_iccp/pcaps/generated/iccp-phase1.pcap
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PCAP="${PCAP:-$REPO_ROOT/pcaps/generated/iccp-phase1.pcap}"
 
 echo "=== packets grouped by conformance block ==="
 tshark -r "$PCAP" -d tcp.port==10102,tpkt \
