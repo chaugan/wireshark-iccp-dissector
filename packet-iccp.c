@@ -58,11 +58,25 @@
 #include <wsutil/wmem/wmem_map.h>
 #include <wsutil/wmem/wmem_array.h>
 #include <epan/uat.h>
+#include <epan/proto_data.h>
+#include <epan/dissectors/packet-ber.h>
 
 /* uat_add_record is exported from libwireshark but its prototype lives
  * in epan/uat-int.h which plugins should not depend on. Declare it
  * locally with the same signature. Stable across Wireshark 3.x/4.x. */
 extern void *uat_add_record(uat_t *uat, const void *orig_rec_ptr, bool valid_rec);
+
+/* Per-frame "already processed" flag key for p_add_proto_data. Used to
+ * de-duplicate when a frame would otherwise hit both the OID-level
+ * wrapper (during dissection) and the post-dissector (after dissection). */
+#define ICCP_PFRAME_DONE_KEY 0xCAFEBABEu
+
+/* Set at handoff. NULL if MMS isn't loaded into Wireshark (very rare). */
+static dissector_handle_t mms_handle = NULL;
+
+/* Forward decl: the wrapper that lives above dissect_iccp in this file
+ * calls dissect_iccp directly, so the compiler needs the prototype. */
+static int dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data);
 
 #include <string.h>
 
@@ -1034,9 +1048,71 @@ attach_decoded_values(proto_node *node, gpointer user_data)
     proto_tree_children_foreach(node, attach_decoded_values, ctx);
 }
 
+/* OID-level wrapper around the MMS dissector.
+ *
+ * Architectural reason for this code path (HANDOVER section 4):
+ * post-dissectors run AFTER the column / layer-list snapshot the
+ * Wireshark GUI takes for each frame, so when this plugin lived
+ * purely as a post-dissector the GUI's Protocol column kept showing
+ * "MMS/IEC61850" instead of "ICCP", the Info column showed whatever
+ * MMS wrote, the iccp display filter took until Ctrl+R to start
+ * matching, and the Statistics dialog routinely showed empty axes
+ * during live captures because it had snapshotted before our tap
+ * fired.
+ *
+ * To get into the dispatch chain DURING dissection we register
+ * ourselves under the canonical MMS abstract-syntax OID
+ * (1.0.9506.2.1) using register_ber_oid_dissector_handle. Plugin
+ * registration runs after the built-in MMS dissector's own
+ * registration, so our handle wins the OID lookup. PRES then calls
+ * us instead of MMS, we call MMS via its handle (preserving every
+ * MMS proto-tree node our scanner expects), then run the same
+ * analysis the post-dissector did but during dissection. The
+ * resulting layer chain is ...:pres:iccp with mms hung underneath
+ * us, the GUI columns reflect ICCP from the start, and stats
+ * accumulate as packets arrive without depending on retap timing.
+ *
+ * The post-dissector remains registered as a fallback for captures
+ * where MMS dispatches via something other than PRES OID lookup
+ * (e.g., the MMS heuristic dissector on COTP for substations that
+ * skip PRES). The de-dup flag in dissect_iccp prevents double-
+ * counting when both paths fire on the same frame. */
+static int
+iccp_dispatch_via_oid(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
+{
+    int consumed = 0;
+    if (mms_handle) {
+        consumed = call_dissector_only(mms_handle, tvb, pinfo, tree, data);
+    }
+    if (consumed <= 0) {
+        consumed = tvb_captured_length(tvb);
+    }
+
+    /* Run the existing analysis. dissect_iccp checks the de-dup flag
+     * at entry so we mark the frame BEFORE calling it -- otherwise
+     * the post-dissector pass would have to re-run the same analysis
+     * later for nothing. Wait, we want analysis to run NOW from the
+     * wrapper. The flag is set *after* analysis to mean "post-dissector
+     * skip me". */
+    dissect_iccp(tvb, pinfo, tree, data);
+    p_add_proto_data(pinfo->pool, pinfo, proto_iccp, ICCP_PFRAME_DONE_KEY,
+                     GINT_TO_POINTER(1));
+
+    return consumed;
+}
+
 static int
 dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_)
 {
+    /* De-duplicate vs the OID-level wrapper. iccp_dispatch_via_oid
+     * runs during dissection (PRES->MMS->us via the BER OID dispatcher)
+     * and processes the frame fully; the post-dissector hook then
+     * fires later with the same frame, so we'd otherwise tap-queue
+     * twice and double every count. The wrapper marks each frame in
+     * pinfo proto-data; we early-out here when it's set. */
+    if (p_get_proto_data(pinfo->pool, pinfo, proto_iccp, ICCP_PFRAME_DONE_KEY))
+        return tvb_captured_length(tvb);
+
     if (!proto_is_frame_protocol(pinfo->layers, "mms"))
         return 0;
     if (!tree)
@@ -1956,6 +2032,31 @@ void
 proto_reg_handoff_iccp(void)
 {
     iccp_inject_pres_binding();
+
+    /* Locate the MMS dissector. It's a built-in (not a plugin) so
+     * find_dissector should always succeed; if it doesn't, we fall
+     * back to post-dissector-only operation and the user gets the
+     * old GUI behaviour. */
+    mms_handle = find_dissector("mms");
+    if (mms_handle) {
+        /* Register OUR handler at the canonical MMS abstract-syntax
+         * OID. This OVERRIDES the MMS dissector's own registration
+         * for the same OID (last-registered wins in the BER OID
+         * dispatch table, and plugin handoffs run after built-in
+         * dissector handoffs). PRES then calls us; we call MMS via
+         * its handle and then run our analysis -- all during
+         * dissection, fixing the GUI Protocol/Info columns and the
+         * stats dialog timing problems documented in HANDOVER S4. */
+        dissector_handle_t our_oid_handle =
+            create_dissector_handle(iccp_dispatch_via_oid, proto_iccp);
+        register_ber_oid_dissector_handle("1.0.9506.2.1", our_oid_handle,
+                                          proto_iccp, "ICCP/TASE.2");
+        /* Some IEC 61850-flavoured MMS uses a different abstract syntax
+         * OID. Register under that one too so we wrap MMS regardless. */
+        register_ber_oid_dissector_handle("1.0.9506.2.3", our_oid_handle,
+                                          proto_iccp, "ICCP/TASE.2 (IEC 61850 syntax)");
+    }
+
 
     /* Tell epan to keep these MMS fields alive in the proto tree so our
      * post-dissector can read them even when tshark is running without
