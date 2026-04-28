@@ -2068,10 +2068,19 @@ proto_reg_handoff_iccp(void)
     iccp_inject_pres_binding();
 
     /* Locate the MMS dissector. It's a built-in (not a plugin) so
-     * find_dissector should always succeed; if it doesn't, we fall
-     * back to post-dissector-only operation and the user gets the
-     * old GUI behaviour. */
-    mms_handle = find_dissector("mms");
+     * find_dissector_add_dependency should always succeed; if it
+     * doesn't, we fall back to post-dissector-only operation and the
+     * user gets the old GUI behaviour.
+     *
+     * Use find_dissector_add_dependency rather than plain find_dissector
+     * so Wireshark's tree optimizer registers proto_iccp as depending
+     * on proto_mms. The optimizer uses these dependencies plus the
+     * post-dissector wanted-hfids set to decide which MMS fields to
+     * preserve in the proto tree on every dissection -- including the
+     * stats retap path that's been silently dropping fields and
+     * leaving our walker with nothing to find. The dependency has to
+     * be registered to make the wanted-hfids actually persist. */
+    mms_handle = find_dissector_add_dependency("mms", proto_iccp);
     if (mms_handle) {
         /* Register OUR handler at the canonical MMS abstract-syntax
          * OID. This OVERRIDES the MMS dissector's own registration
