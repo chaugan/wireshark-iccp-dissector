@@ -1125,9 +1125,21 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
                                                  tvb, 0, 0, state_str);
     proto_item_set_generated(state_it);
 
-    if (info->confirmation_name[0]) {
+    /* Prefer this PDU's actual variable name. scan.matched_name is set
+     * only when the name matched a TASE.2 reserved-name pattern;
+     * scan.first_name is the first identifier the tree walk saw on this
+     * PDU regardless of pattern match. info->confirmation_name is the
+     * (often stale) name that originally promoted the association --
+     * useful as a last resort but it doesn't reflect what this frame is
+     * actually accessing. */
+    const char *display_name =
+        scan.matched_name           ? scan.matched_name :
+        scan.first_name             ? scan.first_name   :
+        info->confirmation_name[0]  ? info->confirmation_name :
+                                      NULL;
+    if (display_name) {
         proto_item *nit = proto_tree_add_string(itree, hf_iccp_object_name,
-                                                tvb, 0, 0, info->confirmation_name);
+                                                tvb, 0, 0, display_name);
         proto_item_set_generated(nit);
     }
 
