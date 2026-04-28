@@ -2191,4 +2191,24 @@ proto_reg_handoff_iccp(void)
          * GUI). */
         g_string_free(err, TRUE);
     }
+
+    /* Belt-and-suspenders for the GUI Statistics dialog: the
+     * stats_tree_register_plugin flag arg should propagate
+     * TL_REQUIRES_PROTO_TREE down to its internal tap listener, but
+     * empirically (Wireshark 4.2.x) the GUI Stats dialog can still end
+     * up replaying cached/empty tap data on retap -- only the
+     * unconditional axes (ICCP peers, PDU sizes, Association state
+     * via sticky conv-state) populate while everything that depends
+     * on freshly-walked MMS proto-tree fields stays zero. Adding a
+     * separate, explicit register_tap_listener for the "iccp" tap
+     * with TL_REQUIRES_PROTO_TREE forces every retap on this tap to
+     * fully re-dissect packets, regardless of how the stats listener
+     * was registered. The callback itself is a no-op. */
+    GString *err2 = register_tap_listener("iccp", NULL, NULL,
+                                          TL_REQUIRES_PROTO_TREE,
+                                          NULL, iccp_force_tree_packet,
+                                          NULL, 0);
+    if (err2) {
+        g_string_free(err2, TRUE);
+    }
 }
