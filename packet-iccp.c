@@ -61,6 +61,7 @@
 #include <epan/proto_data.h>
 #include <epan/dissectors/packet-ber.h>
 #include <epan/epan_dissect.h>
+#include <epan/exceptions.h>
 
 /* uat_add_record is exported from libwireshark but its prototype lives
  * in epan/uat-int.h which plugins should not depend on. Declare it
@@ -1089,6 +1090,249 @@ attach_decoded_values(proto_node *node, gpointer user_data)
 }
 
 /* -------------------------------------------------------------------------
+ * BER recovery walker
+ *
+ * Wireshark's MMS dissector hits a recursion-depth assertion in
+ * mms.c:2103 once a SEQUENCE OF Data has more than ~2 items. When that
+ * fires, MMS aborts mid-list and the per-item fields (mms.floating_point,
+ * mms.data_bit-string, mms.AccessResult, ...) are NOT placed in the
+ * proto tree past the bug threshold. walk_tree() above sees only the
+ * first 1-2 items and undercounts everything by an order of magnitude.
+ *
+ * The recovery walker decodes the MMS PDU's listOfAccessResult /
+ * listOfData directly from the BER bytes and updates the same
+ * iccp_pdu_flags_t counters + the iccp_walk_ctx_t point arrays. It runs
+ * after walk_tree() and *raises* the counts so the recovered values win
+ * whenever MMS gave up early.
+ *
+ * Handles the three MMS PDU shapes that carry SEQUENCE OF Data:
+ *   - InformationReport       A3 > A0 > [varAccessSpec] > A0 (listOfAccessResult)
+ *   - Confirmed-Request.write A0 > [02 invokeID] > A5 > [varAccessSpec] > A0 (listOfData)
+ *   - Confirmed-Response.read A1 > [02 invokeID] > A4 > [varAccessSpec OPT] > A1 (listOfAccessResult)
+ *
+ * No proto-tree side effects -- this is a counting / value-extraction
+ * pass only. attach_decoded_values() still adds Point #N rows for items
+ * the MMS dissector DID place in the tree; recovered items past the bug
+ * threshold contribute to counts and stats but not to per-row tree
+ * visualization (could be added later by emitting hf_iccp_point_value /
+ * hf_iccp_point_quality items here too).
+ *
+ * Best-effort: any malformed BER aborts the walk gracefully without
+ * recording garbage. 16-level depth limit on nested structure/array.
+ * ---------------------------------------------------------------------- */
+
+static gboolean
+iccp_ber_read_tl(const guint8 **p, const guint8 *end,
+                 guint8 *tag_out, guint32 *len_out)
+{
+    if (*p >= end) return FALSE;
+    guint8 tag = *(*p)++;
+    if (*p >= end) return FALSE;
+    guint8 b = *(*p)++;
+    guint32 len;
+    if (b < 0x80) {
+        len = b;
+    } else {
+        guint8 n = b & 0x7f;
+        if (n == 0 || n > 4 || (gsize)(end - *p) < n) return FALSE;
+        len = 0;
+        for (guint8 i = 0; i < n; i++) len = (len << 8) | *(*p)++;
+    }
+    if ((gsize)(end - *p) < len) return FALSE;
+    *tag_out = tag;
+    *len_out = len;
+    return TRUE;
+}
+
+/* TASE.2 quality byte high two bits encode validity. Match the encoding
+ * the existing point_validities axis uses (see maybe_synthesise_point). */
+static guint8
+iccp_quality_validity_class(guint8 q)
+{
+    switch (q & 0xc0) {
+        case 0x80: return 0;  /* VALID */
+        case 0xc0: return 1;  /* SUSPECT */
+        case 0x40: return 2;  /* HELD */
+        default:   return 3;  /* NOT_VALID */
+    }
+}
+
+static void
+iccp_ber_walk_one_data(guint8 tag, const guint8 *content, guint32 len,
+                       iccp_pdu_flags_t *flags, iccp_walk_ctx_t *walk_ctx,
+                       int depth)
+{
+    if (depth > 16) return;
+    switch (tag) {
+        case 0x83: /* boolean [3] */
+            break;
+        case 0x84: /* bit-string [4] */
+            flags->bit_string_count++;
+            if (len >= 2 && walk_ctx && walk_ctx->point_validities) {
+                /* content[0] is the unused-bits count; the quality byte is
+                 * the next byte. Append the validity class, matching the
+                 * mapping the proto-tree-driven path uses. */
+                guint8 q  = content[1];
+                guint8 vc = iccp_quality_validity_class(q);
+                wmem_array_append_one(walk_ctx->point_validities, vc);
+            }
+            break;
+        case 0x85: /* integer [5] */
+        case 0x86: /* unsigned [6] */
+            break;
+        case 0x87: /* floating-point [7] */
+            flags->floating_point_count++;
+            if (len >= 5 && walk_ctx && walk_ctx->point_values) {
+                /* TASE.2 floating-point: 1-byte exponent indicator at
+                 * content[0] (8 = IEEE-754 single, 11 = double), then
+                 * 4 bytes IEEE-754 BE for single. We only handle single
+                 * here; doubles are rare in TASE.2 transfer sets. */
+                guint32 raw = ((guint32)content[1] << 24)
+                            | ((guint32)content[2] << 16)
+                            | ((guint32)content[3] <<  8)
+                            |  (guint32)content[4];
+                gfloat f;
+                memcpy(&f, &raw, 4);
+                wmem_array_append_one(walk_ctx->point_values, f);
+            }
+            break;
+        case 0x89: /* octet-string [9] */
+            flags->octet_string_count++;
+            break;
+        case 0x8a: /* visible-string [10] */
+            flags->visible_string_count++;
+            break;
+        case 0x8c: /* binary-time [12] */
+            flags->binary_time_count++;
+            break;
+        case 0xa1: /* array     [1] IMPLICIT SEQUENCE OF Data */
+        case 0xa2: /* structure [2] IMPLICIT SEQUENCE OF Data */
+            flags->structure_count++;
+            {
+                const guint8 *p = content, *end = content + len;
+                while (p < end) {
+                    guint8 t; guint32 l;
+                    if (!iccp_ber_read_tl(&p, end, &t, &l)) break;
+                    iccp_ber_walk_one_data(t, p, l, flags, walk_ctx, depth + 1);
+                    p += l;
+                }
+            }
+            break;
+        default:
+            /* unknown / unhandled Data alternative — ignore */
+            break;
+    }
+}
+
+/* Walk a SEQUENCE OF AccessResult or SEQUENCE OF Data and update the
+ * caller's flags/walk_ctx. is_access_result flips the failure-vs-success
+ * dispatch: AccessResult.failure is [0] IMPLICIT (tag 0x80 / 0xa0) while
+ * AccessResult.success is bare Data. */
+static void
+iccp_ber_walk_seq_of(const guint8 *content, guint32 len,
+                     iccp_pdu_flags_t *flags, iccp_walk_ctx_t *walk_ctx,
+                     gboolean is_access_result)
+{
+    const guint8 *p = content;
+    const guint8 *end = content + len;
+    guint32 items = 0;
+    guint32 failures = 0;
+    while (p < end) {
+        guint8 t; guint32 l;
+        if (!iccp_ber_read_tl(&p, end, &t, &l)) break;
+        items++;
+        if (is_access_result && (t == 0x80 || t == 0xa0)) {
+            failures++;
+        } else {
+            iccp_ber_walk_one_data(t, p, l, flags, walk_ctx, 0);
+        }
+        p += l;
+    }
+    if (is_access_result) {
+        if (items    > flags->access_result_count) flags->access_result_count = items;
+        if (failures > flags->failure_count)       flags->failure_count       = failures;
+    }
+}
+
+/* Navigate from the MMS PDU root tag to the list-of-Data SEQUENCE OF and
+ * walk it. Tolerant: returns silently on any structural mismatch. */
+static void
+iccp_ber_recover(tvbuff_t *tvb, iccp_pdu_flags_t *flags, iccp_walk_ctx_t *walk_ctx)
+{
+    if (!tvb || !flags) return;
+    gint avail = tvb_captured_length(tvb);
+    if (avail < 4) return;
+    const guint8 *base = tvb_get_ptr(tvb, 0, avail);
+    if (!base) return;
+    const guint8 *p = base, *end = base + avail;
+
+    guint8 top_tag; guint32 top_len;
+    if (!iccp_ber_read_tl(&p, end, &top_tag, &top_len)) return;
+    const guint8 *top_end = p + top_len;
+
+    if (top_tag == 0xa3) {
+        /* unconfirmed-PDU: contents are informationReport [0] IMPLICIT (A0) */
+        guint8 t; guint32 l;
+        if (!iccp_ber_read_tl(&p, top_end, &t, &l)) return;
+        if (t != 0xa0) return;
+        const guint8 *ir_end = p + l;
+        /* Skip variableAccessSpecification (whatever its tag is). */
+        if (!iccp_ber_read_tl(&p, ir_end, &t, &l)) return;
+        p += l;
+        /* listOfAccessResult [0] IMPLICIT (A0) */
+        if (!iccp_ber_read_tl(&p, ir_end, &t, &l)) return;
+        if (t != 0xa0) return;
+        iccp_ber_walk_seq_of(p, l, flags, walk_ctx, TRUE);
+        return;
+    }
+    if (top_tag == 0xa0) {
+        /* confirmed-RequestPDU: invokeID + confirmedServiceRequest CHOICE */
+        guint8 t; guint32 l;
+        if (!iccp_ber_read_tl(&p, top_end, &t, &l)) return;
+        if (t != 0x02) return;
+        p += l;
+        if (!iccp_ber_read_tl(&p, top_end, &t, &l)) return;
+        if (t == 0xa5) {
+            /* write [5] IMPLICIT: variableAccessSpec, listOfData [0] (A0) */
+            const guint8 *wr_end = p + l;
+            guint8 t2; guint32 l2;
+            if (!iccp_ber_read_tl(&p, wr_end, &t2, &l2)) return;
+            p += l2;
+            if (!iccp_ber_read_tl(&p, wr_end, &t2, &l2)) return;
+            if (t2 != 0xa0) return;
+            iccp_ber_walk_seq_of(p, l2, flags, walk_ctx, FALSE);
+        }
+        return;
+    }
+    if (top_tag == 0xa1) {
+        /* confirmed-ResponsePDU: invokeID + confirmedServiceResponse CHOICE */
+        guint8 t; guint32 l;
+        if (!iccp_ber_read_tl(&p, top_end, &t, &l)) return;
+        if (t != 0x02) return;
+        p += l;
+        if (!iccp_ber_read_tl(&p, top_end, &t, &l)) return;
+        if (t == 0xa4) {
+            /* read [4] IMPLICIT: optional varAccessSpec, listOfAccessResult [1] (A1) */
+            const guint8 *rd_end = p + l;
+            /* Walk forward until we find the A1 listOfAccessResult tag. */
+            while (p < rd_end) {
+                guint8 t2; guint32 l2;
+                const guint8 *before = p;
+                if (!iccp_ber_read_tl(&p, rd_end, &t2, &l2)) return;
+                if (t2 == 0xa1) {
+                    iccp_ber_walk_seq_of(p, l2, flags, walk_ctx, TRUE);
+                    return;
+                }
+                p = before;
+                p += /* skip this item: tag + length-of-length + length */
+                     ((p[1] < 0x80) ? 2 : 2 + (p[1] & 0x7f)) + l2;
+            }
+        }
+        return;
+    }
+}
+
+/* -------------------------------------------------------------------------
  * Shared analysis helper
  *
  * Encapsulates walk_tree + attach_decoded_values + classify +
@@ -1111,7 +1355,7 @@ typedef struct {
 } iccp_analysis_t;
 
 static gboolean
-iccp_analyse_tree(packet_info *pinfo, proto_tree *tree,
+iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
                   iccp_analysis_t *out, gboolean read_only,
                   wmem_allocator_t *array_scope)
 {
@@ -1128,6 +1372,52 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree,
         || out->flags.bit_string_count   > 0
         || out->flags.structure_count    > 0) {
         proto_tree_children_foreach(tree, attach_decoded_values, &out->walk_ctx);
+    }
+
+    /* Recover counts + point values from the BER bytes when MMS gave up
+     * mid-list (mms.c:2103 recursion-depth assertion). On frames where
+     * MMS dissected fully the recovery walker observes the same items
+     * the proto-tree walker already counted; on frames where MMS aborted
+     * it fills in the rest of the SEQUENCE OF Data.
+     *
+     * Walk into temporaries, then merge into the main flags/walk_ctx via
+     * max-replace: BER counts win when they're larger (canonical, derived
+     * from raw bytes), and the BER point arrays replace the tree-derived
+     * ones when they hold more values. The proto-tree path stays the sole
+     * driver for Point #N synthetic rows in the proto tree -- BER walker
+     * does not mutate the tree. */
+    {
+        iccp_pdu_flags_t ber_flags;
+        iccp_walk_ctx_t  ber_ctx;
+        memset(&ber_flags, 0, sizeof ber_flags);
+        memset(&ber_ctx,   0, sizeof ber_ctx);
+        ber_ctx.point_values     = wmem_array_new(array_scope, sizeof(gfloat));
+        ber_ctx.point_validities = wmem_array_new(array_scope, sizeof(guint8));
+        iccp_ber_recover(tvb, &ber_flags, &ber_ctx);
+
+        #define ICCP_MAX_FIELD(f)  do { \
+            if (ber_flags.f > out->flags.f) out->flags.f = ber_flags.f; \
+        } while (0)
+        ICCP_MAX_FIELD(access_result_count);
+        ICCP_MAX_FIELD(failure_count);
+        ICCP_MAX_FIELD(structure_count);
+        ICCP_MAX_FIELD(floating_point_count);
+        ICCP_MAX_FIELD(bit_string_count);
+        ICCP_MAX_FIELD(binary_time_count);
+        ICCP_MAX_FIELD(visible_string_count);
+        ICCP_MAX_FIELD(octet_string_count);
+        #undef ICCP_MAX_FIELD
+
+        guint ber_pv_n = wmem_array_get_count(ber_ctx.point_values);
+        guint tree_pv_n = wmem_array_get_count(out->walk_ctx.point_values);
+        if (ber_pv_n > tree_pv_n) {
+            out->walk_ctx.point_values = ber_ctx.point_values;
+        }
+        guint ber_pq_n = wmem_array_get_count(ber_ctx.point_validities);
+        guint tree_pq_n = wmem_array_get_count(out->walk_ctx.point_validities);
+        if (ber_pq_n > tree_pq_n) {
+            out->walk_ctx.point_validities = ber_ctx.point_validities;
+        }
     }
 
     out->op = classify_operation(&out->flags);
@@ -1345,19 +1635,44 @@ static int
 iccp_dispatch_via_oid(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data)
 {
     int consumed = 0;
+    /* MMS's listOfAccessResult / listOfData walker hits a recursion-depth
+     * assertion in epan/dissectors/packet-mms.c:2103 once a SEQUENCE OF
+     * Data has more than ~2 items. The assertion throws DissectorError,
+     * which Wireshark's outer dispatcher catches and *appends* the bug
+     * text to col_info. Without TRY/CATCH here, that exception unwinds
+     * past us and our analysis never runs for the affected frame.
+     * Catching it lets us:
+     *   - run the BER recovery walker on the full PDU bytes (recovers
+     *     floats / quality bytes / counts past the bug threshold)
+     *   - clear the bug text out of col_info and write a clean ICCP
+     *     summary in its place
+     *   - let the post-dissector pass be skipped via ICCP_PFRAME_DONE_KEY */
+    gboolean mms_aborted = FALSE;
     if (mms_handle) {
-        consumed = call_dissector_only(mms_handle, tvb, pinfo, tree, data);
+        TRY {
+            consumed = call_dissector_only(mms_handle, tvb, pinfo, tree, data);
+        }
+        CATCH(DissectorError) {
+            mms_aborted = TRUE;
+        }
+        ENDTRY;
     }
     if (consumed <= 0) {
         consumed = tvb_captured_length(tvb);
     }
+    if (mms_aborted) {
+        /* The CATCH ate the exception, but Wireshark's expert-info path
+         * had already poked the bug message into col_info before the
+         * stack unwound. Drop it so dissect_iccp's col_append below
+         * starts from a clean slate. */
+        col_set_writable(pinfo->cinfo, COL_INFO, TRUE);
+        col_clear_fence(pinfo->cinfo, COL_INFO);
+        col_clear(pinfo->cinfo, COL_INFO);
+    }
 
     /* Run the existing analysis. dissect_iccp checks the de-dup flag
-     * at entry so we mark the frame BEFORE calling it -- otherwise
-     * the post-dissector pass would have to re-run the same analysis
-     * later for nothing. Wait, we want analysis to run NOW from the
-     * wrapper. The flag is set *after* analysis to mean "post-dissector
-     * skip me". */
+     * at entry so we mark the frame AFTER calling it -- the flag means
+     * "post-dissector skip me, the OID-level wrapper handled this". */
     dissect_iccp(tvb, pinfo, tree, data);
     p_add_proto_data(pinfo->pool, pinfo, proto_iccp, ICCP_PFRAME_DONE_KEY,
                      GINT_TO_POINTER(1));
@@ -1383,7 +1698,7 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
         return 0;
 
     iccp_analysis_t a;
-    if (!iccp_analyse_tree(pinfo, tree, &a, FALSE, pinfo->pool))
+    if (!iccp_analyse_tree(pinfo, tree, tvb, &a, FALSE, pinfo->pool))
         return 0;
 
     /* Re-enable writes (MMS / IEC61850 may have frozen them), clear
