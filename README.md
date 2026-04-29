@@ -23,7 +23,7 @@ Be aware of this asymmetry before you decide what this plugin is worth:
 | Display filters (`iccp`, `iccp.point.value`, `iccp.scope`, …) | yes                     | yes — **but the GUI's first-pass column-load needs `Ctrl+R` after opening a fresh file before filters match** |
 | Protocol column reads `ICCP`                              | yes                         | **no** — Wireshark renders the GUI's Protocol column from the layer chain *before* post-dissectors run, so it stays `MMS/IEC61850` |
 | Info column reads `ICCP InformationReport`                | yes                         | **no** — same reason as Protocol column                                        |
-| `Statistics → ICCP/Statistics` populates                  | yes (`-z iccp,tree`)        | works after `Ctrl+R` in many flows, has shown 0 counts in some — depends on Wireshark's retap timing; tshark `-z iccp,tree` is the reliable path |
+| `Statistics → ICCP/Statistics` populates                  | yes (`-z iccp,tree`)        | yes — an always-on tap listener fires on every dissection and re-emits saved tap data on retap, so the dialog populates immediately on first open (no `Ctrl+R` dance) |
 | Expert-info on SBO violations                             | yes (synthetic capture)     | yes (synthetic capture)                                                        |
 
 The GUI column ceiling is a Wireshark architectural constraint we
@@ -235,6 +235,38 @@ The resulting `.so` runs only inside WSL's Linux Wireshark. A Windows
 build against a Wireshark source tree matching the installed Windows
 Wireshark version — cross-compiling from WSL to a Windows MSVC-
 compatible DLL is not a clean path.
+
+## Build (Windows, portable — no admin, no Visual Studio)
+
+`scripts/win-portable-build.ps1` bootstraps a per-user toolchain (portable
+MSVC + Windows SDK via [mmozeiko's portable-msvc.py](https://gist.github.com/mmozeiko/7f3162ec2988e81e56d5c4e22cde9977),
+plus pinned CMake, Ninja, Strawberry Perl, and winflexbison), builds a
+minimal Wireshark dev tree from source against it, and produces
+`iccp.dll` — all without admin rights, without an installed Wireshark,
+and without Visual Studio Build Tools. Everything lives under
+`$HOME\.iccp-build\`.
+
+```powershell
+# First run (~10 min wall time): downloads MSVC + SDK + CMake + Ninja + Perl
+# + winflexbison, builds Wireshark 4.2 libs, then iccp.dll. Installs to
+# %APPDATA%\Wireshark\plugins\4.2\epan\.
+.\scripts\win-portable-build.ps1
+
+# Target a different Wireshark minor (each version's dev tree is cached
+# separately under %BuildRoot%\ws-{src,build,install}-<minor>):
+.\scripts\win-portable-build.ps1 -WiresharkBranch release-4.4
+.\scripts\win-portable-build.ps1 -WiresharkBranch release-4.6
+
+# Re-runs are fast (~5 sec) — only Phase 3 (the plugin compile) re-runs
+# if Phase 1 (toolchain) and Phase 2 (Wireshark dev tree) are cached.
+```
+
+Useful flags: `-WiresharkDevTree <path>` to skip Phase 2 and reuse a
+pre-built dev tree; `-SkipInstall` to leave the DLL in the build dir;
+`-ForceMSVC` / `-ForceWireshark` to redo Phase 1 / 2.
+
+Requires Python 3 on PATH (Mambaforge / standard installer / Microsoft
+Store all work) — the portable-MSVC fetcher is a Python script.
 
 ## Build (Windows, native MSVC)
 
