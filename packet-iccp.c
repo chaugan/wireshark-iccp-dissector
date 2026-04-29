@@ -1144,17 +1144,15 @@ iccp_ber_read_tl(const guint8 **p, const guint8 *end,
     return TRUE;
 }
 
-/* TASE.2 quality byte high two bits encode validity. Match the encoding
- * the existing point_validities axis uses (see maybe_synthesise_point). */
+/* TASE.2 quality byte high two bits encode validity:
+ *   00 = VALID, 01 = HELD, 10 = SUSPECT, 11 = NOT_VALID.
+ * Returned class index matches what maybe_synthesise_point uses
+ * ((q & ICCP_Q_VALIDITY_MASK) >> 6) so the stats / tap-info /
+ * point_validities array indices line up with the existing axis. */
 static guint8
 iccp_quality_validity_class(guint8 q)
 {
-    switch (q & 0xc0) {
-        case 0x80: return 0;  /* VALID */
-        case 0xc0: return 1;  /* SUSPECT */
-        case 0x40: return 2;  /* HELD */
-        default:   return 3;  /* NOT_VALID */
-    }
+    return (guint8)((q & 0xC0) >> 6);
 }
 
 static void
