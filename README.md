@@ -6,30 +6,39 @@ electric utility control centers use to exchange real-time data, events,
 and device commands over MMS.
 
 Out-of-tree C plugin, builds as a `.so` for Linux Wireshark or a `.dll`
-for Windows Wireshark. Runs as a **post-dissector** on top of Wireshark's
-existing MMS stack (TPKT → COTP → ISO 8327 Session → ISO 8823 Presentation
-→ ACSE → MMS); it does not re-parse MMS but adds a semantic layer on top.
+for Windows Wireshark. Wraps the MMS dissector at OID dispatch — sits
+under the existing TPKT → COTP → ISO 8327 Session → ISO 8823 Presentation
+→ MMS chain and adds a semantic layer on top without re-parsing MMS.
+
+**Pre-built binaries** for Wireshark 4.2 / 4.4 / 4.6 (Linux `.so` and
+Windows `.dll`) are published on the [Releases page](https://github.com/chaugan/wireshark-iccp-dissector/releases).
+Each binary is ABI-locked to its target Wireshark minor — `iccp.so`
+built against 4.2 will not load into 4.4. Drop into
+`~/.local/lib/wireshark/plugins/<X.Y>/epan/iccp.so` (Linux) or
+`%APPDATA%\Wireshark\plugins\<X.Y>\epan\iccp.dll` (Windows).
 
 ## Where things work — tshark vs Wireshark GUI
 
-Be aware of this asymmetry before you decide what this plugin is worth:
+| Capability                                                | tshark CLI                  | Wireshark GUI                                                          |
+|-----------------------------------------------------------|-----------------------------|------------------------------------------------------------------------|
+| ICCP tree under the MMS tree (Operation, CB, scope, …)    | yes                         | yes                                                                    |
+| Synthesised `Point #N: <value> [quality]` rows            | yes                         | yes                                                                    |
+| Inline IEEE-754 float decode under `mms.floating_point`   | yes                         | yes                                                                    |
+| TASE.2 quality byte → named flag subfields                | yes                         | yes                                                                    |
+| Display filters (`iccp`, `iccp.point.value`, `iccp.scope`, …) | yes                     | yes (first-pass; the OID-level wrapper runs during dissection, so `iccp.*` fields materialise without a `Ctrl+R`) |
+| Protocol column reads `ICCP`                              | yes                         | yes (since v0.4 the plugin wraps MMS at OID dispatch instead of post-dissecting, so `COL_PROTOCOL` is `ICCP` during the first pass) |
+| Info column reads `ICCP InformationReport [<category>: <name>]` | yes                  | yes (same OID wrapper path as Protocol column)                          |
+| `Statistics → ICCP/Statistics` populates                  | yes (`-z iccp,tree`)        | yes — an always-on tap listener fires on every dissection and re-emits saved tap data on retap, so the dialog populates immediately on first open |
+| Per-point recovery past the upstream MMS recursion bug    | yes                         | yes (since v0.5.1 — see *Non-obvious implementation notes*)            |
+| Expert-info on SBO violations                             | yes (synthetic capture)     | yes (synthetic capture)                                                |
 
-| Capability                                                | tshark CLI                  | Wireshark GUI                                                                  |
-|-----------------------------------------------------------|-----------------------------|--------------------------------------------------------------------------------|
-| ICCP tree under the MMS tree (Operation, CB, scope, …)    | yes                         | yes                                                                            |
-| Synthesised `Point #N: <value> [quality]` rows            | yes                         | yes                                                                            |
-| Inline IEEE-754 float decode under `mms.floating_point`   | yes                         | yes                                                                            |
-| TASE.2 quality byte → named flag subfields                | yes                         | yes                                                                            |
-| Display filters (`iccp`, `iccp.point.value`, `iccp.scope`, …) | yes                     | yes — **but the GUI's first-pass column-load needs `Ctrl+R` after opening a fresh file before filters match** |
-| Protocol column reads `ICCP`                              | yes                         | **no** — Wireshark renders the GUI's Protocol column from the layer chain *before* post-dissectors run, so it stays `MMS/IEC61850` |
-| Info column reads `ICCP InformationReport`                | yes                         | **no** — same reason as Protocol column                                        |
-| `Statistics → ICCP/Statistics` populates                  | yes (`-z iccp,tree`)        | yes — an always-on tap listener fires on every dissection and re-emits saved tap data on retap, so the dialog populates immediately on first open (no `Ctrl+R` dance) |
-| Expert-info on SBO violations                             | yes (synthetic capture)     | yes (synthetic capture)                                                        |
-
-The GUI column ceiling is a Wireshark architectural constraint we
-chase in v0.4 by restructuring as a wrapping dissector instead of a
-post-dissector. The functional analysis (the tree, the filters, the
-stats, the expert info) is intact today in both interfaces.
+Both interfaces give the same functional analysis (tree, filters, stats,
+expert info, per-point quality + values). Earlier releases had a
+post-dissector ordering issue that left the GUI's Protocol/Info columns
+reading `MMS/IEC61850` and required a `Ctrl+R` retap for stats and
+filters; v0.4 fixed Protocol/Info via the OID wrapper, v0.5 fixed stats
+via the always-on tap listener, v0.5.1 fixed per-point data loss caused
+by Wireshark's MMS dissector aborting on multi-item reports.
 
 ## What it does (functional behaviour, valid in both tshark and GUI)
 
@@ -65,9 +74,8 @@ stats, the expert info) is intact today in both interfaces.
 
 ## Features at a glance
 
-What plain MMS gives you vs what this plugin adds. "GUI" below means
-"after `Ctrl+R` on a fresh file open" because of the first-pass
-column-load issue documented above.
+What plain MMS gives you vs what this plugin adds. Behaviour is the same
+in tshark and the Wireshark GUI on first open — no `Ctrl+R` dance.
 
 | Area                          | Plain MMS shows                  | This plugin adds                                                                            |
 |-------------------------------|----------------------------------|---------------------------------------------------------------------------------------------|
@@ -81,8 +89,9 @@ column-load issue documented above.
 | **Quality bytes**             | `bit-string: 80` (raw)           | Decoded TASE.2 IndicationPoint quality: Validity / Normal / TS_invalid / Source flags + summary |
 | **IndicationPoints**          | structure of (float, bit-string) | Synthesised `Point #N: <value> [VALID / CURRENT / NORMAL / TS_OK]` row per point            |
 | **Transfer Set reports**      | `success / failure` per item     | `iccp.report.*`: per-PDU points / success / failure / structured summary                    |
-| **Protocol column**           | `MMS/IEC61850`                   | tshark: `ICCP`. Wireshark GUI: still `MMS/IEC61850` — see the asymmetry table above         |
-| **Info column**               | varies by MMS PDU                | tshark: `ICCP InformationReport [<category>: <name>]`. Wireshark GUI: not overridden by us, you see whatever MMS wrote |
+| **Per-point recovery**        | bug-capped: only the first 1-2 points of any multi-point report visible (`mms.c:2103` recursion-depth assertion fires on real reports of tens to hundreds of points) | BER walker decodes the rest of `listOfAccessResult` / `listOfData` directly from the PDU bytes; on the real anonymized capture this lifts max points/report from 1 to 384. The `[Dissector bug, …mms.c:2103…]` text no longer appears in `col_info` either |
+| **Protocol column**           | `MMS/IEC61850`                   | `ICCP` in both tshark and the GUI (OID wrapper since v0.4 makes this work during first-pass dissection) |
+| **Info column**               | varies by MMS PDU                | `<MMS PDU type> [<domain>] <itemId> \| ICCP <op> [<category>: <name>]` in both tshark and the GUI |
 | **Statistics tree axes**      | none                             | Operation, Object category, Conformance Block, Association state, Device sub-operation, Report outcomes, Points per Transfer Set, Point quality, Point value range, ICCP peers (src→dst), Operations by scope |
 | **External tap**              | none                             | `register_tap("iccp")` exposes per-packet ICCP attributes (op, cb, category, scope, domain, point counts, quality breakdown, value min/max/sum) to Lua / custom listeners |
 | **Display filters**           | `mms.*`                          | `iccp`, `iccp.point.value` (FT_FLOAT, I/O-graphable), `iccp.quality.*`, `iccp.scope`, `iccp.domain`, `iccp.cb`, `iccp.device.state`, `iccp.object.category`, `iccp.report.*` |
@@ -118,25 +127,25 @@ operators actually run in production.
 | `iccp.object.category`      | string  | `Bilateral Table`, `Device SBO Operate`, …          |
 | `iccp.cb`                   | uint8   | Conformance Block number (1..9)                     |
 | `iccp.device.state`         | string  | `Idle` / `Selected` / `Operated`                    |
-| `iccp.scope`                       | string  | `VCC` (public) or `Bilateral` (peer-pair scope)     |
-| `iccp.domain`                      | string  | Bilateral Table id when scope=Bilateral             |
-| `iccp.note`                        | string  | Free-form annotation attached to PDUs of interest   |
-| `iccp.point`                       | string  | Synthesised `Point #N: <value> [quality]` row       |
-| `iccp.point.value`                 | float   | Decoded numeric point value (graphable in I/O)      |
-| `iccp.point.quality`               | string  | Per-point quality summary                           |
-| `iccp.point.index`                 | uint32  | Sequential index assigned within the PDU            |
-| `iccp.quality`                     | uint8   | Raw TASE.2 quality byte (bitmask parent)            |
-| `iccp.quality.validity`            | uint8   | 0=VALID, 1=HELD, 2=SUSPECT, 3=NOT_VALID             |
-| `iccp.quality.off_normal`          | bool    | Off-normal flag (bit 5)                             |
-| `iccp.quality.timestamp_invalid`   | bool    | Timestamp invalid flag (bit 4)                      |
-| `iccp.quality.source`              | uint8   | 0=CURRENT, 1=HELD, 2=SUBSTITUTED, 3=GARBLED         |
-| `iccp.quality.summary`             | string  | One-line `VALIDITY / SOURCE / NORMAL / TS_OK` digest |
-| `iccp.value.real`                  | float   | Inline-decoded MMS floating-point primitive         |
-| `iccp.report.point_count`          | uint32  | Total AccessResult items in an InformationReport    |
-| `iccp.report.success_count`        | uint32  | Successful items                                    |
-| `iccp.report.failure_count`        | uint32  | Failed items                                        |
-| `iccp.report.structured`           | bool    | Whether the report payload contains TASE.2-shaped structures |
-| `iccp.report.summary`              | string  | Human-readable per-PDU report summary               |
+| `iccp.scope`                | string  | `VCC` (public) or `Bilateral` (peer-pair scope)     |
+| `iccp.domain`               | string  | Bilateral Table id when scope=Bilateral             |
+| `iccp.note`                 | string  | Free-form annotation attached to PDUs of interest   |
+| `iccp.point`                | string  | Synthesised `Point #N: <value> [quality]` row       |
+| `iccp.point.value`          | float   | Decoded numeric point value (graphable in I/O)      |
+| `iccp.point.quality`        | string  | Per-point quality summary                           |
+| `iccp.point.index`          | uint32  | Sequential index assigned within the PDU            |
+| `iccp.quality`              | uint8   | Raw TASE.2 quality byte (bitmask parent)            |
+| `iccp.quality.validity`     | uint8   | 0=VALID, 1=HELD, 2=SUSPECT, 3=NOT_VALID             |
+| `iccp.quality.off_normal`   | bool    | Off-normal flag (bit 5)                             |
+| `iccp.quality.timestamp_invalid` | bool | Timestamp invalid flag (bit 4)                     |
+| `iccp.quality.source`       | uint8   | 0=CURRENT, 1=HELD, 2=SUBSTITUTED, 3=GARBLED         |
+| `iccp.quality.summary`      | string  | One-line `VALIDITY / SOURCE / NORMAL / TS_OK` digest |
+| `iccp.value.real`           | float   | Inline-decoded MMS floating-point primitive         |
+| `iccp.report.point_count`   | uint32  | Total AccessResult items in an InformationReport (recovered from PDU bytes, so accurate even past the upstream MMS recursion-depth bug) |
+| `iccp.report.success_count` | uint32  | Successful items                                    |
+| `iccp.report.failure_count` | uint32  | Failed items                                        |
+| `iccp.report.structured`    | bool    | Whether the report payload contains TASE.2-shaped structures |
+| `iccp.report.summary`       | string  | Per-PDU `floats=N bit-strings=N binary-times=N visible-strings=N octet-strings=N` digest |
 
 Expert-info filters (each fires under specific ICCP conditions):
 
@@ -151,11 +160,11 @@ Expert-info filters (each fires under specific ICCP conditions):
 
 ## Supported Wireshark versions
 
-Built and tested against **Wireshark 4.2** (Ubuntu 24.04 `libwireshark-dev`
-and Windows-native MSVC build from source). Plugin code guards the
-4.4+-only `plugin_describe()` symbol with `#if __has_include(<wsutil/plugins.h>)`,
-so the same source tree should build cleanly against 4.4, 4.6, or master
-too — you just rebuild per version.
+Built and released for **Wireshark 4.2, 4.4 and 4.6** (Linux `.so` and
+Windows `.dll` for each minor — see the [Releases page](https://github.com/chaugan/wireshark-iccp-dissector/releases)).
+The same source tree builds against any of the three; plugin code
+guards the 4.4+-only `plugin_describe()` symbol with
+`#if __has_include(<wsutil/plugins.h>)` so you don't have to fork.
 
 Plugins are **ABI-locked** to the Wireshark minor version they were built
 against (the `plugin_want_major` / `plugin_want_minor` symbols enforce
@@ -414,9 +423,16 @@ the pcap cannot be linked back to any real-world utility.
 bash tests/regression.sh
 ```
 
-25 assertions covering all 9 conformance blocks, all tracked operations,
-the Device-Control state machine, and the no-false-positive guard
-(plain-MMS Initiate doesn't promote to Confirmed ICCP).
+21 assertions covering all 9 Conformance Blocks, every tracked
+operation, the Device-Control state machine, and the no-false-positive
+guard (plain-MMS Initiate doesn't promote to Confirmed ICCP).
+
+A separate Lua tap-listener smoke test `tests/verify_stats.lua` counts
+ICCP frames against a known-good fixture:
+
+```bash
+tshark -2 -X lua_script:tests/verify_stats.lua -r pcaps/local/iccp2-annon.pcap -q
+```
 
 ## Sanitizing a real-world ICCP capture for sharing
 
@@ -510,88 +526,54 @@ the cert expires.
 
 ## Using the plugin on a real-world ICCP capture
 
-Real-world TASE.2 links associate once and then stay up for days or
-weeks. If your capture started mid-session (very common) Wireshark
-missed the Connect-Presentation (A-ASSOCIATE) exchange — the single
-packet that binds each Presentation Context Identifier (PCI) to its
-Abstract Syntax OID. Without that binding, Wireshark shows
-*"dissector is not available"* under ISO 8823 Presentation on every
-MMS frame, and our ICCP post-dissector never runs because its
-`proto_is_frame_protocol(pinfo->layers, "mms")` gate is never TRUE.
+Real-world TASE.2 links associate once and stay up for days or weeks. A
+capture that starts mid-session (the common case for utility operators
+dropping a tap on a long-lived link) misses the Connect-Presentation
+(A-ASSOCIATE) exchange that binds each Presentation Context Identifier
+(PCI) to its Abstract Syntax OID. Without that binding, Wireshark would
+show *"dissector is not available"* under ISO 8823 Presentation on every
+MMS frame, and the ICCP layer would never see the data.
 
-Fix: tell Wireshark manually which PCI is MMS.
+The plugin **auto-injects the canonical ICCP binding** (PCI 3 → MMS
+abstract-syntax OID `1.0.9506.2.1` and `1.0.9506.2.3`) into Wireshark's
+in-memory `pres.users_table` at handoff, so this just works for the
+overwhelming majority of real captures with no manual configuration.
+Open the pcap and the iccp tree, columns, filters, and stats populate.
 
-### Step 1 — find the PCI the session uses
+### When auto-injection isn't enough
 
-**Linux / WSL**
+If a vendor uses a non-standard PCI for MMS (anything other than 3) or a
+non-canonical abstract-syntax OID, you need to add a row manually. Find
+the PCI and OID:
 
 ```bash
 tshark -r your.pcap -T fields -e pres.presentation_context_identifier \
     | awk 'NF' | sort -u
-```
-
-**Windows (PowerShell)**
-
-```powershell
-tshark -r .\your.pcap -T fields -e pres.presentation_context_identifier |
-    Where-Object { $_ -match '\d' } | Sort-Object -Unique
-```
-
-Typical output is a single small integer like `3` (often `1` + `3` if
-you also want to nail down ACSE: `1` is the ACSE context, `3` is the
-MMS one — numbers vary per vendor).
-
-### Step 2 — bind that PCI to MMS
-
-**In the Wireshark GUI:**
-
-Edit → Preferences → Protocols → **PRES** → **Users Context List** →
-*Edit…* → *New*
-
-| Field | Value |
-|-------|-------|
-| Context Id | the number from step 1 |
-| Syntax Name OID | `1.0.9506.2.1` (MMS abstract-syntax, ISO 9506-2) |
-
-If you saw two PCIs in step 1, add a second row with the ACSE OID
-`2.2.1.0.1`. Click *OK* → *OK*. The preference persists in your
-Wireshark profile.
-
-**From the command line (same effect, scriptable):**
-
-```bash
-tshark -r your.pcap \
-    -o 'pres.users_table:"3","1.0.9506.2.1"' \
-    -Y iccp -V | less
-```
-
-### Step 3 — confirm MMS now dispatches
-
-```bash
-tshark -r your.pcap -o 'pres.users_table:"3","1.0.9506.2.1"' \
-    -T fields -e frame.protocols | sort -u | grep mms
-```
-
-You should see `eth:ethertype:ip:tcp:cotp:ses:pres:mms` on data frames.
-From that point our ICCP post-dissector fires and `iccp.operation`,
-`iccp.object.category`, `iccp.cb`, etc. become valid display filters in
-**tshark**. In the **Wireshark GUI** the same filters work but you may
-need to press `Ctrl+R` once after opening the file to rebuild the
-field-info index — Wireshark's first-pass column load skips
-post-dissector tree work, so `iccp.*` fields don't materialise until a
-full re-dissection is forced. The ICCP subtree itself is always built
-when you click on a frame to inspect it.
-
-If MMS still doesn't dispatch, the peers may have negotiated a
-vendor-specific abstract-syntax OID instead of the canonical
-`1.0.9506.2.1`. Pull the OID directly from the (rare, lucky) frame
-that carries the CP:
-
-```bash
 tshark -r your.pcap -T fields -e pres.abstract_syntax_name | sort -u
 ```
 
-…and substitute that OID in step 2.
+Then either:
+
+**Wireshark GUI**: Edit → Preferences → Protocols → **PRES** → **Users
+Context List** → *Edit…* → *New*. Set *Context Id* to your PCI and
+*Syntax Name OID* to `1.0.9506.2.1` (or the vendor OID you observed).
+The preference persists in your profile.
+
+**tshark / scripted**: pass the binding inline.
+
+```bash
+tshark -r your.pcap -o 'pres.users_table:"7","1.0.9506.2.1"' -Y iccp -V
+```
+
+Sanity check that MMS now dispatches:
+
+```bash
+tshark -r your.pcap -T fields -e frame.protocols | sort -u | grep mms
+# expect: eth:ethertype:ip:tcp:cotp:ses:pres:iccp:mms
+```
+
+User-set bindings win over the plugin's defaults — if you have an
+existing row for PCI 3, your value is kept.
 
 ---
 
@@ -621,6 +603,25 @@ Documented in `packet-iccp.c` comment header but worth surfacing:
 5. ICCP uses TCP port 102. On non-standard ports, Wireshark won't
    dispatch TPKT / COTP / MMS automatically — pass
    `-d tcp.port==<port>,tpkt` to force it.
+6. **Wireshark's MMS dissector aborts on multi-item reports.** A
+   recursion-depth assertion at `epan/dissectors/packet-mms.c:2103`
+   fires whenever a `SEQUENCE OF Data` has more than ~2 items. On real
+   ICCP traffic this fires on essentially every InformationReport. The
+   plugin handles this in two places:
+   (a) `iccp_dispatch_via_oid` wraps `call_dissector_only(mms_handle,
+   …)` in `TRY/CATCH(DissectorError)` so the assertion is absorbed
+   before Wireshark's outer dispatcher can paste the bug text into
+   `col_info`;
+   (b) a hand-rolled BER walker (`iccp_ber_recover`) decodes
+   `listOfAccessResult` / `listOfData` directly from the PDU bytes,
+   walks structures and arrays recursively, and feeds the same
+   counters and point arrays the proto-tree path uses, so floats and
+   quality bytes past item 2 still feed the stats and tap.
+7. Plugin handoff calls `iccp_inject_pres_binding` to add the canonical
+   ICCP context binding (PCI 3 → MMS abstract-syntax `1.0.9506.2.1`)
+   into the in-memory `pres.users_table`. This makes mid-session
+   captures (which miss the AARQ) dispatch to MMS without manual
+   preference configuration. User-set entries for the same PCI win.
 
 ## License
 
