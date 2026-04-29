@@ -363,11 +363,17 @@ or any other minor version — the ABI is pinned via the `plugin_want_major`
 ## Generating a test PCAP
 
 No public ICCP PCAPs of meaningful quality are known (utilities guard
-them as sensitive). This tree ships a generator that uses
-`libIEC61850`'s MMS server + `mms_utility` client on localhost,
-requesting TASE.2-reserved variable names. The server returns
+them as sensitive). Two generators are shipped with this repo, for
+different purposes:
+
+### `scripts/gen-pcap.sh` — coverage capture for the dissector regression suite
+
+Uses `libIEC61850`'s MMS server + `mms_utility` client on localhost,
+requesting TASE.2-reserved variable names across all nine Conformance
+Blocks plus the Block-5 device state machine. The server returns
 "does-not-exist" but the request PDU on the wire carries the ICCP
-name, which is enough to exercise the dissector.
+name, which is enough to exercise the dissector. Each request is its
+own short-lived MMS association.
 
 ```bash
 # requires libiec61850 built once under ~/src/libiec61850
@@ -375,7 +381,32 @@ bash scripts/gen-pcap.sh
 ```
 
 Produces `pcaps/generated/iccp-phase1.pcap` (~280 packets covering all
-9 conformance blocks, Device Control state-machine, and an SBO violation).
+9 Conformance Blocks, Device Control state-machine, and an SBO violation).
+
+### `scripts/gen-iccp-pcap.py` — fictional realistic ICCP capture
+
+A self-contained Python synthesizer (no libIEC61850, no network
+privileges) that produces an ICCP capture structurally similar to
+real-world utility-to-utility traffic — long-lived bilateral
+associations, cyclic Block-2 InformationReports at 1 / 4 / 60 s
+periods with float + quality-byte payloads, occasional Write-Request
+control commands, mix of CYCLIC and SPONTAN transfer sets — using a
+controlled fictional wordlist (peer codenames `AURORA`, `BLAZE`, …;
+domains like `AURORA_BLAZE`; datasets like `DS_ANA_M_Z_NRT`). RFC 5737
+documentation IPs only.
+
+```bash
+python3 scripts/gen-iccp-pcap.py -o pcaps/generated/iccp-fictional.pcap
+# default: 5 minutes simulated, 5 bilateral peers, ~2 400 packets
+python3 scripts/gen-iccp-pcap.py --duration 60 --seed 7 -o /tmp/short.pcap
+```
+
+The output is suitable for sharing as a sample capture, for
+demonstrating the dissector to ICCP engineers, or for regression
+runs that benefit from realistic traffic shape (cadence, point-quality
+distribution, multi-bilateral peer mesh) — none of which the
+`gen-pcap.sh` coverage capture gives. Names are entirely fictional and
+the pcap cannot be linked back to any real-world utility.
 
 ## Running the regression suite
 
