@@ -74,28 +74,32 @@ by Wireshark's MMS dissector aborting on multi-item reports.
 
 ## Features at a glance
 
-What plain MMS gives you vs what this plugin adds. Behaviour is the same
-in tshark and the Wireshark GUI on first open — no `Ctrl+R` dance.
+What plain MMS gives you vs what this plugin adds. The "plain MMS"
+column is what you'd see with the built-in Wireshark MMS dissector
+(`epan/dissectors/packet-mms.c`) and no plugin loaded; verified by
+inspection against Wireshark 4.6 and by running tshark with this
+plugin removed. Behaviour is the same in tshark and the Wireshark GUI
+on first open — no `Ctrl+R` dance.
 
 | Area                          | Plain MMS shows                  | This plugin adds                                                                            |
 |-------------------------------|----------------------------------|---------------------------------------------------------------------------------------------|
 | **ICCP subtree**              | nothing                          | An `[Inter-Control Center Communications Protocol (ICCP/TASE.2)]` block under MMS with operation, association state, conformance block, scope, domain, point summaries, report counts |
-| **Naming conventions**        | raw `domainId.itemId` strings    | TASE.2 category (Bilateral Table, DSConditions, Device, Information_Message, …) + CB number |
-| **Name scope**                | `domain-specific` vs `vmd-specific` enum | `iccp.scope` field: `VCC` (public) vs `Bilateral` (peer-pair); Bilateral Table domain id surfaced |
-| **Association tracking**      | per-MMS-PDU only                 | per-conversation `Candidate → Confirmed → Closed` state across the whole flow              |
-| **Block 5 Device Control**    | raw `Device_*Select / Operate` writes | cross-conversation SBO state machine (Idle → Selected → Operated). Validated on synthetic capture only |
+| **Naming conventions**        | raw `domainId` / `itemId` strings under `domain-specific` ObjectName | TASE.2 category (Bilateral Table, DSConditions, Device, Information_Message, …) + Conformance Block number |
+| **Name scope**                | the `domain-specific` / `vmd-specific` / `aa-specific` ObjectName CHOICE alternative | `iccp.scope` field: `VCC` (public) vs `Bilateral` (peer-pair); the Bilateral Table domain id is surfaced as a top-level field rather than buried inside the ObjectName |
+| **Association tracking**      | per-PDU only — MMS tracks request/response invokeIDs but has no notion of an ICCP association lifecycle | per-conversation `Candidate → Confirmed → Closed` state across the whole TCP flow, promoted only when a TASE.2 reserved name has actually been seen (so plain IEC 61850 traffic doesn't false-positive) |
+| **Block 5 Device Control**    | raw `Device_*Select / Operate` Read/Write PDUs, no semantics | cross-conversation SBO state machine (Idle → Selected → Operated). Validated on synthetic capture only |
 | **SBO security**              | nothing                          | Expert-info on SBO violation (Operate without Select), Direct Operate, stale Select. Synthetic only |
-| **Floating-point values**     | `0800000000` (raw 5-byte hex)    | Inline IEEE-754 decode under each `mms.floating_point` leaf (`Decoded float: 49.978`)       |
-| **Quality bytes**             | `bit-string: 80` (raw)           | Decoded TASE.2 IndicationPoint quality: Validity / Normal / TS_invalid / Source flags + summary |
-| **IndicationPoints**          | structure of (float, bit-string) | Synthesised `Point #N: <value> [VALID / CURRENT / NORMAL / TS_OK]` row per point            |
-| **Transfer Set reports**      | `success / failure` per item     | `iccp.report.*`: per-PDU points / success / failure / structured summary                    |
-| **Per-point recovery**        | bug-capped: only the first 1-2 points of any multi-point report visible (`mms.c:2103` recursion-depth assertion fires on real reports of tens to hundreds of points) | BER walker decodes the rest of `listOfAccessResult` / `listOfData` directly from the PDU bytes; on the real anonymized capture this lifts max points/report from 1 to 384. The `[Dissector bug, …mms.c:2103…]` text no longer appears in `col_info` either |
-| **Protocol column**           | `MMS/IEC61850`                   | `ICCP` in both tshark and the GUI (OID wrapper since v0.4 makes this work during first-pass dissection) |
-| **Info column**               | varies by MMS PDU                | `<MMS PDU type> [<domain>] <itemId> \| ICCP <op> [<category>: <name>]` in both tshark and the GUI |
-| **Statistics tree axes**      | none                             | Operation, Object category, Conformance Block, Association state, Device sub-operation, Report outcomes, Points per Transfer Set, Point quality, Point value range, ICCP peers (src→dst), Operations by scope |
-| **External tap**              | none                             | `register_tap("iccp")` exposes per-packet ICCP attributes (op, cb, category, scope, domain, point counts, quality breakdown, value min/max/sum) to Lua / custom listeners |
-| **Display filters**           | `mms.*`                          | `iccp`, `iccp.point.value` (FT_FLOAT, I/O-graphable), `iccp.quality.*`, `iccp.scope`, `iccp.domain`, `iccp.cb`, `iccp.device.state`, `iccp.object.category`, `iccp.report.*` |
-| **I/O graphs**                | not meaningful for MMS           | `AVG(iccp.point.value)` plots grid frequency / MW / setpoints from a capture                |
+| **Floating-point values**     | `mms.floating_point` is **`FT_BYTES`** in MMS — the proto tree shows the raw 5-byte hex (e.g. `0800000000`); MMS only decodes the float internally for IEC-61850 Info-column text and never exposes a decoded value as a sub-field for ICCP traffic | Inline IEEE-754 decode emitted as a generated `iccp.value.real` (FT_FLOAT) child under each `mms.floating_point` leaf (`Decoded float: 49.978`); filter- and graph-able |
+| **Quality bytes**             | `mms.data_bit-string` is **`FT_BYTES`** — quality byte shown as raw hex with no flag-level decode | Decoded TASE.2 IndicationPoint quality: `iccp.quality.validity / .off_normal / .timestamp_invalid / .source` (each filter-able) plus a one-line `iccp.quality.summary` digest |
+| **IndicationPoints**          | generic `mms.structure_element` (FT_NONE) with separate float and bit-string children — no pairing | Synthesised `Point #N: <value> [VALIDITY / SOURCE / NORMAL / TS_OK]` single-line row per point under each structure |
+| **Transfer Set reports**      | `AccessResult: success / failure` per item — no per-report summary | `iccp.report.*`: per-PDU `point_count`, `success_count`, `failure_count`, structured-flag, and a `floats=N bit-strings=N …` summary line |
+| **Per-point recovery**        | bug-capped: Wireshark's MMS dissector hits a recursion-depth assertion at `mms.c:2103` once a `SEQUENCE OF Data` has more than ~2 items, and aborts. On real ICCP captures this fires on essentially every report (which carry tens to hundreds of points), so plain MMS shows at most the first 1-2 items in the proto tree and pastes `[Dissector bug, … mms.c:2103 …]` into Info | BER walker decodes the rest of `listOfAccessResult` / `listOfData` directly from the PDU bytes after MMS aborts; on the real anonymized capture this lifts max points/report from 1 to 384. `iccp_dispatch_via_oid` wraps the MMS call in `TRY/CATCH(DissectorError)` so the bug text no longer appears in `col_info` either |
+| **Protocol column**           | `MMS` (or `MMS/IEC61850` when the IEC 61850 mapping preference is on, which is the default) | `ICCP` in both tshark and the GUI — the OID wrapper since v0.4 owns the ICCP abstract-syntax OIDs and writes the column during first-pass dissection |
+| **Info column**               | `col_clear` at start of `dissect_mms`; for ICCP-flavoured PDUs the MMS dissector then writes nothing (the `IEC 61850` Info-column branches all gate on IEC-61850-specific markers like `IEC61850_8_1_RPT`, `IEC61850_ITEM_ID_OPER`, the IEC-61850 confirmed-service PDU types). For an Initiate-Request MMS does write `Associate Request`; for InformationReports — the dominant ICCP traffic — Info is left empty and you typically see whatever PRES/SES wrote (`DATA TRANSFER (DT) SPDU`) | `<MMS PDU label> \| ICCP <op> [<category>: <name>]` in both tshark and the GUI; for Write-Request it also includes the inline-decoded float (e.g. `confirmed-RequestPDU -11.76 \| ICCP Write-Request`) |
+| **Statistics tree axes**      | none — the MMS dissector does not register a `stats_tree` | Operation, Object category, Conformance Block, Association state, Device sub-operation, Report outcomes, Points per Transfer Set, Point quality, Point value range, ICCP peers (src→dst), Operations by scope |
+| **External tap**              | none — the MMS dissector does not call `register_tap()` | `register_tap("iccp")` exposes per-packet ICCP attributes (op, cb, category, scope, domain, point counts, quality breakdown, value min/max/sum) to Lua / custom listeners |
+| **Display filters**           | `mms.*` only; numeric filters on values don't work because `mms.floating_point` is FT_BYTES | `iccp`, `iccp.point.value` (FT_FLOAT, I/O-graphable), `iccp.quality.*`, `iccp.scope`, `iccp.domain`, `iccp.cb`, `iccp.device.state`, `iccp.object.category`, `iccp.report.*`, `iccp.value.real` |
+| **I/O graphs**                | not numerically aggregable — `mms.floating_point` is FT_BYTES so `AVG()` / `MIN()` / `MAX()` can't operate on the value | `AVG(iccp.point.value)`, `MAX(iccp.point.value)`, etc. plot grid frequency / MW / setpoints from a capture           |
 | **PCAP scrubbing**            | not provided                     | `scripts/wash-pcap.py` SHA-256-hashes BER strings; `--scrub-numeric` also redacts primitive numeric values (off by default — turning it on can break MMS dispatch on captures that key off specific values) |
 
 ### Conformance-Block coverage
