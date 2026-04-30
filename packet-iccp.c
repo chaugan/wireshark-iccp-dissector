@@ -166,6 +166,13 @@ static int hf_iccp_point_name        = -1;
 static const char *iccp_dsd_lookup(const char *domain,
                                    const char *transfer_set,
                                    guint32 slot);
+static void        iccp_dsd_capture(tvbuff_t *tvb);
+static void        iccp_dsd_auto_reset(void);
+static gboolean    iccp_ber_read_object_name(const guint8 **p,
+                                             const guint8 *end,
+                                             wmem_allocator_t *scope,
+                                             char **domain_out,
+                                             char **item_out);
 
 static gint ett_iccp         = -1;
 static gint ett_iccp_objects = -1;
@@ -797,7 +804,15 @@ walk_tree(packet_info *pinfo _U_, proto_tree *tree,
          * we want to classify and surface as iccp.object.name. */
         else if (!strcmp(s, "Identifier")
               || !strcmp(s, "itemId")
+              /* 4.6 abbrev for the same itemId field. asn2wrs renamed the
+               * generated hfid path from "mms.itemId" to
+               * "mms.objectName_domain_specific_itemId" -- without this
+               * branch, walk_tree finds no name, scan.matched stays NULL,
+               * and the per-Transfer-Set stats axis collapses to a single
+               * "(unnamed)" bucket on every report. */
+              || !strcmp(s, "objectName_domain_specific_itemId")
               || !strcmp(s, "vmd_specific")
+              || !strcmp(s, "aa_specific")
               || !strcmp(s, "newIdentifier")) {
             if (fi->value) {
                 const char *sv = fvalue_get_string(fi->value);
@@ -905,6 +920,13 @@ typedef struct {
      * finds nothing to synthesise from. NULL means "don't emit hidden
      * items"; the BER walker still updates counters and arrays. */
     proto_tree *hidden_tree;
+    /* Data-set reference extracted from variableAccessSpecification
+     * variableListName [1] of an unconfirmed informationReport (or the
+     * write/read variants). Domain + item identify the DSD that bound
+     * slots to variable names; iccp_dsd_lookup keys off these.
+     * Strings are pinfo->pool-scoped (live for the dissection only). */
+    const char *ds_domain;
+    const char *ds_item;
 } iccp_walk_ctx_t;
 
 static void attach_decoded_values(proto_node *node, gpointer user_data);
@@ -1355,15 +1377,53 @@ iccp_ber_recover(tvbuff_t *tvb, iccp_pdu_flags_t *flags, iccp_walk_ctx_t *walk_c
     if (!iccp_ber_read_tl(&p, end, &top_tag, &top_len)) return;
     const guint8 *top_end = p + top_len;
 
+    /* Classify the MMS PDU from its top-level tag. This duplicates what
+     * walk_tree derives from MMS proto-tree fields, but runs even when
+     * MMS items aren't in the tree -- the case Wireshark's two-pass
+     * filter mode and most non-visible dissection paths leave us in.
+     * Without this, the surface gate fails on filter-only passes and
+     * `iccp` matches zero frames in the GUI even though every clicked
+     * frame shows the iccp tree fine. */
+    switch (top_tag) {
+    case 0xa0: flags->has_confirmed_req  = TRUE; break;
+    case 0xa1: flags->has_confirmed_resp = TRUE; break;
+    case 0xa2: flags->has_confirmed_err  = TRUE; break;
+    case 0xa3: flags->has_info_report    = TRUE; break;
+    case 0xa4: flags->has_reject         = TRUE; break;
+    case 0xa8: flags->has_initiate_req   = TRUE; break;
+    case 0xa9: flags->has_initiate_resp  = TRUE; break;
+    case 0xab: flags->has_conclude_req   = TRUE; break;
+    case 0xac: flags->has_conclude_resp  = TRUE; break;
+    default:   break;
+    }
+
     if (top_tag == 0xa3) {
         /* unconfirmed-PDU: contents are informationReport [0] IMPLICIT (A0) */
         guint8 t; guint32 l;
         if (!iccp_ber_read_tl(&p, top_end, &t, &l)) return;
         if (t != 0xa0) return;
         const guint8 *ir_end = p + l;
-        /* Skip variableAccessSpecification (whatever its tag is). */
+        /* variableAccessSpecification CHOICE:
+         *   listOfVariable    [0] IMPLICIT SEQ OF VarSpec  (tag 0xa0)
+         *   variableListName  [1] EXPLICIT ObjectName      (tag 0xa1)
+         * For the [1] form, parse the inner ObjectName -- that's the
+         * data-set reference we need to key DSD lookups off. */
         if (!iccp_ber_read_tl(&p, ir_end, &t, &l)) return;
-        p += l;
+        const guint8 *vas_end = p + l;
+        if (t == 0xa1 && walk_ctx) {
+            char *dom = NULL, *item = NULL;
+            /* Use file scope so the strings survive past iccp_analyse_tree
+             * (the walk_ctx fields are read by dissect_iccp later in the
+             * same dissection -- packet scope would be safer but is not
+             * accessible without pinfo at this layer). Strings are short
+             * (<32 chars) and the file scope is freed on file close. */
+            if (iccp_ber_read_object_name(&p, vas_end, wmem_file_scope(),
+                                          &dom, &item)) {
+                walk_ctx->ds_domain = dom;
+                walk_ctx->ds_item   = item;
+            }
+        }
+        p = vas_end;
         /* listOfAccessResult [0] IMPLICIT (A0) */
         if (!iccp_ber_read_tl(&p, ir_end, &t, &l)) return;
         if (t != 0xa0) return;
@@ -1377,6 +1437,16 @@ iccp_ber_recover(tvbuff_t *tvb, iccp_pdu_flags_t *flags, iccp_walk_ctx_t *walk_c
         if (t != 0x02) return;
         p += l;
         if (!iccp_ber_read_tl(&p, top_end, &t, &l)) return;
+        /* ConfirmedServiceRequest CHOICE inner tags. */
+        switch (t) {
+        case 0xa1: flags->has_get_namelist = TRUE; break;  /* getNameList    [1] */
+        case 0xa4: flags->has_read         = TRUE; break;  /* read           [4] */
+        case 0xa5: flags->has_write        = TRUE; break;  /* write          [5] */
+        case 0xa6: flags->has_get_var_attr = TRUE; break;  /* getVarAccessAttributes [6] */
+        case 0xab: flags->has_define_nvl   = TRUE; break;  /* defineNVL     [11] */
+        case 0xad: flags->has_delete_nvl   = TRUE; break;  /* deleteNVL     [13] */
+        default: break;
+        }
         if (t == 0xa5) {
             /* write [5] IMPLICIT: variableAccessSpec, listOfData [0] (A0) */
             const guint8 *wr_end = p + l;
@@ -1396,6 +1466,15 @@ iccp_ber_recover(tvbuff_t *tvb, iccp_pdu_flags_t *flags, iccp_walk_ctx_t *walk_c
         if (t != 0x02) return;
         p += l;
         if (!iccp_ber_read_tl(&p, top_end, &t, &l)) return;
+        switch (t) {
+        case 0xa1: flags->has_get_namelist = TRUE; break;
+        case 0xa4: flags->has_read         = TRUE; break;
+        case 0xa5: flags->has_write        = TRUE; break;
+        case 0xa6: flags->has_get_var_attr = TRUE; break;
+        case 0xab: flags->has_define_nvl   = TRUE; break;
+        case 0xad: flags->has_delete_nvl   = TRUE; break;
+        default: break;
+        }
         if (t == 0xa4) {
             /* read [4] IMPLICIT: optional varAccessSpec, listOfAccessResult [1] (A1) */
             const guint8 *rd_end = p + l;
@@ -1543,6 +1622,38 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
         ICCP_MAX_FIELD(octet_string_count);
         #undef ICCP_MAX_FIELD
 
+        /* Op-detection booleans set by iccp_ber_recover from the PDU's
+         * top-level + inner CHOICE tags. walk_tree derives the same
+         * booleans from MMS proto-tree fields, but in Wireshark's
+         * two-pass filter mode (which the GUI uses for display
+         * filters) the second pass dissects with a reduced wanted-
+         * fields set and MMS items aren't kept in the tree. Without
+         * these booleans, classify_operation returns ICCP_OP_NONE,
+         * the surface gate fails, and the iccp tree is never built --
+         * which is exactly the symptom of the GUI's `iccp` filter
+         * matching nothing while the per-frame iccp tree displays
+         * fine on a clicked frame. OR-merge from BER so either path
+         * sets the flag. */
+        #define ICCP_OR_FIELD(f)  do { \
+            if (ber_flags.f) out->flags.f = TRUE; \
+        } while (0)
+        ICCP_OR_FIELD(has_initiate_req);
+        ICCP_OR_FIELD(has_initiate_resp);
+        ICCP_OR_FIELD(has_conclude_req);
+        ICCP_OR_FIELD(has_conclude_resp);
+        ICCP_OR_FIELD(has_reject);
+        ICCP_OR_FIELD(has_info_report);
+        ICCP_OR_FIELD(has_confirmed_req);
+        ICCP_OR_FIELD(has_confirmed_resp);
+        ICCP_OR_FIELD(has_confirmed_err);
+        ICCP_OR_FIELD(has_read);
+        ICCP_OR_FIELD(has_write);
+        ICCP_OR_FIELD(has_get_namelist);
+        ICCP_OR_FIELD(has_get_var_attr);
+        ICCP_OR_FIELD(has_define_nvl);
+        ICCP_OR_FIELD(has_delete_nvl);
+        #undef ICCP_OR_FIELD
+
         guint ber_pv_n = wmem_array_get_count(ber_ctx.point_values);
         guint tree_pv_n = wmem_array_get_count(out->walk_ctx.point_values);
         if (ber_pv_n > tree_pv_n) {
@@ -1558,6 +1669,13 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
         if (ber_pq_n > tree_pq_n) {
             out->walk_ctx.point_validities = ber_ctx.point_validities;
         }
+        /* Carry through the data-set reference parsed from
+         * variableAccessSpecification.variableListName. The proto-tree
+         * walker doesn't extract this -- only the BER walker does. */
+        if (ber_ctx.ds_domain && !out->walk_ctx.ds_domain)
+            out->walk_ctx.ds_domain = ber_ctx.ds_domain;
+        if (ber_ctx.ds_item && !out->walk_ctx.ds_item)
+            out->walk_ctx.ds_item   = ber_ctx.ds_item;
     }
 
     out->op = classify_operation(&out->flags);
@@ -1611,7 +1729,13 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
         }
     }
 
-    /* Surface gate. */
+    /* Surface gate. DefineNVL request/response surface unconditionally
+     * because (a) they're significant ICCP setup PDUs worth showing under
+     * the iccp tree even when no naming pattern matched, and (b) the
+     * Define-NVL request carries the slot->name binding we auto-extract
+     * for iccp.point.name -- if the surface gate hides it, dissect_iccp
+     * returns 0 before our capture hook runs and the auto-DSD map stays
+     * empty for the rest of the capture. */
     out->surface =
         (out->conv && out->conv->state == ICCP_ASSOC_CONFIRMED)
         || out->op == ICCP_OP_ASSOC_REQ
@@ -1621,6 +1745,8 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
         || out->op == ICCP_OP_INFORMATION_REPORT
         || out->op == ICCP_OP_READ_RESP
         || out->op == ICCP_OP_WRITE_RESP
+        || out->op == ICCP_OP_DEFINE_NVL_REQ
+        || out->op == ICCP_OP_DEFINE_NVL_RESP
         || out->scan.matched != NULL;
 
     return out->surface;
@@ -1860,6 +1986,13 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
     if (!iccp_analyse_tree(pinfo, tree, tvb, &a, FALSE, pinfo->pool))
         return 0;
 
+    /* On Define-NVL requests, capture the (listDomain, listName) and
+     * ordered variable items into the auto-DSD map so subsequent
+     * InformationReports get slot->name mapping without manual UAT
+     * entry. Idempotent on retap (same bytes -> same content). */
+    if (a.op == ICCP_OP_DEFINE_NVL_REQ)
+        iccp_dsd_capture(tvb);
+
     /* Re-enable writes (MMS / IEC61850 may have frozen them), clear
      * any fence (a fence forces append instead of replace), then
      * set the Protocol column. Wireshark's call_dissector dispatch
@@ -2065,15 +2198,23 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
                     proto_item *si = proto_tree_add_uint(psub, hf_iccp_point_slot,
                                                          tvb, 0, 0, slot);
                     proto_item_set_generated(si);
-                    /* Look up the variable name for this slot from the
-                     * user-supplied DSD mapping (Edit -> Preferences ->
-                     * Protocols -> ICCP -> DSD Mapping). Surface as
-                     * iccp.point.name so analysts can right-click /
-                     * Apply as Filter on a meaningful label. */
+                    /* Look up the variable name for this slot. Prefer the
+                     * data-set reference parsed out of the report's
+                     * variableAccessSpecification.variableListName (set by
+                     * iccp_ber_recover) -- that's the authoritative key
+                     * the DefineNVL request used. Fall back to the
+                     * iccp.domain / iccp.object.name pair when the report
+                     * carried an inline listOfVariable instead.
+                     * Surfaces as iccp.point.name so analysts can
+                     * right-click / Apply as Filter on a meaningful label. */
+                    const char *lookup_dom  = a.walk_ctx.ds_domain
+                        ? a.walk_ctx.ds_domain
+                        : (a.scan.domain_id ? a.scan.domain_id : "");
+                    const char *lookup_item = a.walk_ctx.ds_item
+                        ? a.walk_ctx.ds_item
+                        : (a.scan.matched_name ? a.scan.matched_name : "");
                     const char *vname = iccp_dsd_lookup(
-                        a.scan.domain_id ? a.scan.domain_id : "",
-                        a.scan.matched_name ? a.scan.matched_name : "",
-                        slot);
+                        lookup_dom, lookup_item, slot);
                     if (vname) {
                         proto_item *ni = proto_tree_add_string(psub, hf_iccp_point_name,
                                                                tvb, 0, 0, vname);
@@ -2441,17 +2582,184 @@ static uat_field_t iccp_dsd_fields[] = {
     UAT_END_FIELDS
 };
 
-/* Look up the variable name for a point. Returns NULL if no mapping. */
+/* -------------------------------------------------------------------------
+ * Auto-discovered DSDs (from DefineNamedVariableList-Request frames seen
+ * in the same capture). On every Define-NVL request, walk the BER bytes
+ * to extract (listDomain, listName) and the ordered variable items, and
+ * persist them into a file-scope map keyed by "domain|listName".
+ *
+ * iccp_dsd_lookup falls back to this map after the user-supplied UAT,
+ * so captures that include the negotiation get slot->name mapping for
+ * free; captures that miss it still benefit from manual UAT entries.
+ * ---------------------------------------------------------------------- */
+static wmem_map_t *iccp_dsd_auto = NULL;   /* "domain|listName" -> wmem_array_t of char* */
+
+/* Read an Identifier (BER VisibleString, tag 0x1a) into a wmem_strdup'd char*. */
+static char *
+iccp_ber_read_identifier(const guint8 **p, const guint8 *end, wmem_allocator_t *scope)
+{
+    if (*p >= end) return NULL;
+    const guint8 *save = *p;
+    guint8 t; guint32 l;
+    if (!iccp_ber_read_tl(p, end, &t, &l) || t != 0x1a || (gsize)(end - *p) < l) {
+        *p = save;
+        return NULL;
+    }
+    char *s = (char *)wmem_alloc(scope, l + 1);
+    memcpy(s, *p, l);
+    s[l] = '\0';
+    *p += l;
+    return s;
+}
+
+/* Read an ObjectName: CHOICE { vmd-specific [0] IMPLICIT Identifier,
+ *                              domain-specific [1] IMPLICIT SEQUENCE { domainId, itemId },
+ *                              aa-specific [2] IMPLICIT Identifier }.
+ * Sets *domain_out (NULL for non-domain-specific) and *item_out. */
+static gboolean
+iccp_ber_read_object_name(const guint8 **p, const guint8 *end,
+                          wmem_allocator_t *scope,
+                          char **domain_out, char **item_out)
+{
+    *domain_out = NULL;
+    *item_out   = NULL;
+    if (*p >= end) return FALSE;
+    const guint8 *save = *p;
+    guint8 t; guint32 l;
+    if (!iccp_ber_read_tl(p, end, &t, &l)) {
+        *p = save;
+        return FALSE;
+    }
+    const guint8 *body_end = *p + l;
+    if (body_end > end) {
+        *p = save;
+        return FALSE;
+    }
+    if (t == 0xa1) {
+        /* domain-specific [1] IMPLICIT SEQUENCE { domainId Identifier, itemId Identifier } */
+        char *dom  = iccp_ber_read_identifier(p, body_end, scope);
+        char *item = iccp_ber_read_identifier(p, body_end, scope);
+        *p = body_end;
+        if (!dom || !item) return FALSE;
+        *domain_out = dom;
+        *item_out   = item;
+        return TRUE;
+    }
+    if (t == 0xa0 || t == 0xa2) {
+        /* IMPLICIT Identifier — body bytes ARE the visible string. */
+        char *s = (char *)wmem_alloc(scope, l + 1);
+        memcpy(s, *p, l);
+        s[l] = '\0';
+        *p = body_end;
+        *item_out = s;
+        return TRUE;
+    }
+    *p = body_end;
+    return FALSE;
+}
+
+/* Capture a DSD from a DefineNamedVariableList-Request PDU. Tolerant:
+ * any structural mismatch returns silently. Idempotent: re-visiting a
+ * frame replaces the entry with the same content. */
+static void
+iccp_dsd_capture(tvbuff_t *tvb)
+{
+    if (!tvb) return;
+    gint avail = tvb_captured_length(tvb);
+    if (avail < 6) return;
+    const guint8 *base = tvb_get_ptr(tvb, 0, avail);
+    if (!base) return;
+    const guint8 *p = base, *end = base + avail;
+    wmem_allocator_t *scope = wmem_file_scope();
+
+    /* confirmed-RequestPDU [0] IMPLICIT */
+    guint8 t; guint32 l;
+    if (!iccp_ber_read_tl(&p, end, &t, &l) || t != 0xa0) return;
+    const guint8 *req_end = p + l;
+    if (req_end > end) return;
+    /* invokeID INTEGER */
+    if (!iccp_ber_read_tl(&p, req_end, &t, &l) || t != 0x02) return;
+    p += l;
+    /* confirmedServiceRequest CHOICE — defineNamedVariableList = [11] IMPLICIT (0xab) */
+    if (!iccp_ber_read_tl(&p, req_end, &t, &l) || t != 0xab) return;
+    const guint8 *def_end = p + l;
+    if (def_end > req_end) return;
+
+    /* variableListName: ObjectName */
+    char *list_dom = NULL, *list_item = NULL;
+    if (!iccp_ber_read_object_name(&p, def_end, scope, &list_dom, &list_item)
+        || !list_item) {
+        return;
+    }
+
+    /* listOfVariable [0] IMPLICIT SEQUENCE OF SEQUENCE { variableSpec, alternateAccess [5] OPT } */
+    if (!iccp_ber_read_tl(&p, def_end, &t, &l) || t != 0xa0) return;
+    const guint8 *lov_end = p + l;
+    if (lov_end > def_end) return;
+
+    if (!iccp_dsd_auto) {
+        iccp_dsd_auto = wmem_map_new(scope, g_str_hash, g_str_equal);
+    }
+    char *key = wmem_strdup_printf(scope, "%s|%s",
+                                   list_dom ? list_dom : "", list_item);
+    /* Always overwrite — the wire definition is the source of truth. */
+    wmem_array_t *names = wmem_array_new(scope, sizeof(char *));
+    wmem_map_insert(iccp_dsd_auto, key, names);
+
+    /* Iterate item SEQUENCEs. */
+    while (p < lov_end) {
+        if (!iccp_ber_read_tl(&p, lov_end, &t, &l)) break;
+        const guint8 *item_end = p + l;
+        if (item_end > lov_end) break;
+        if (t != 0x30) { p = item_end; continue; }
+        /* variableSpecification CHOICE — name [0] EXPLICIT ObjectName */
+        guint8 t2; guint32 l2;
+        if (!iccp_ber_read_tl(&p, item_end, &t2, &l2) || t2 != 0xa0) {
+            p = item_end; continue;
+        }
+        const guint8 *name_end = p + l2;
+        char *vd = NULL, *vi = NULL;
+        if (iccp_ber_read_object_name(&p, name_end, scope, &vd, &vi) && vi) {
+            wmem_array_append_one(names, vi);
+        }
+        p = item_end;
+    }
+}
+
+/* Reset the auto-DSD map between files. wmem_file_scope memory is freed
+ * by Wireshark on file close; we just need to drop the dangling pointer
+ * so the next file builds the map fresh. */
+static void
+iccp_dsd_auto_reset(void)
+{
+    iccp_dsd_auto = NULL;
+}
+
+/* Look up the variable name for a point. UAT first, then auto-discovered
+ * DSDs from on-wire DefineNVL frames. Returns NULL if no mapping. */
 static const char *
 iccp_dsd_lookup(const char *domain, const char *transfer_set, guint32 slot)
 {
     if (!domain || !transfer_set) return NULL;
+    /* 1. User-supplied UAT (highest precedence: lets the analyst override
+     *    or supplement what was on the wire). */
     for (guint i = 0; i < iccp_dsd_records_count; i++) {
         const iccp_dsd_record_t *r = &iccp_dsd_records[i];
         if (r->slot == slot
             && g_strcmp0(r->domain,       domain)       == 0
             && g_strcmp0(r->transfer_set, transfer_set) == 0) {
             return r->var_name;
+        }
+    }
+    /* 2. Auto-discovered from DefineNamedVariableList-Request frames in
+     *    this capture. Slot N -> Nth variable in the declared list. */
+    if (iccp_dsd_auto) {
+        char key_buf[512];
+        g_snprintf(key_buf, sizeof key_buf, "%s|%s", domain, transfer_set);
+        wmem_array_t *names = (wmem_array_t *)wmem_map_lookup(iccp_dsd_auto, key_buf);
+        if (names && slot < wmem_array_get_count(names)) {
+            char **arr = (char **)wmem_array_index(names, 0);
+            return arr[slot];
         }
     }
     return NULL;
@@ -2727,6 +3035,11 @@ proto_register_iccp(void)
         "iccp.point.slot.",
         iccp_dsd_uat);
 
+    /* Reset the auto-discovered DSD map between captures. Memory is
+     * wmem_file_scope so Wireshark frees the contents on file close;
+     * we just need to drop the dangling static pointer. */
+    register_init_routine(iccp_dsd_auto_reset);
+
     iccp_handle = create_dissector_handle(dissect_iccp, proto_iccp);
     register_postdissector(iccp_handle);
 
@@ -2900,7 +3213,9 @@ proto_reg_handoff_iccp(void)
         "mms.deleteNamedVariableList_element",
         "mms.Identifier",
         "mms.itemId",
+        "mms.objectName_domain_specific_itemId",  /* 4.6 abbrev */
         "mms.vmd_specific",
+        "mms.aa_specific",
         "mms.domainId",
         "mms.domainSpecific",
         "mms.newIdentifier",

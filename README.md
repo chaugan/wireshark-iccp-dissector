@@ -56,6 +56,23 @@ history of the friction points cleared away:
   preference adds operator-supplied variable names per slot;
   Recovered-points header text auto-adapts to "Per-point listing" on
   Wireshark 4.2.3+ where the MMS subtree above is no longer truncated.
+- **v0.6.1** — Wireshark 4.6 compatibility + DSD auto-discovery.
+  `walk_tree` now also matches `mms.objectName_domain_specific_itemId`
+  (the asn2wrs-renamed `itemId` in 4.6) and `mms.aa_specific`, so the
+  per-Transfer-Set / per-Conformance-Block stats axes populate with
+  named buckets again on 4.6 (4.2 / 4.4 unaffected — the abbrev
+  `mms.itemId` is still recognised). Op classification is now also
+  derived from the PDU's BER tags directly, so the GUI's two-pass
+  display-filter mode (`iccp`, `iccp.operation`, `iccp.point.name == …`)
+  matches every frame instead of one. New auto-discovery path:
+  `DefineNamedVariableList-Request` PDUs are walked at dissection
+  time, the ordered (listDomain, listName) → variable-list mapping
+  is cached per file, and `iccp.point.name` auto-populates on
+  subsequent reports referring to that data set — UAT entries are
+  no longer required when the negotiation is in the capture (and
+  remain the fallback when it isn't). `gen-iccp-pcap.py` emits the
+  matching DefineNVL exchange so the synthetic pcap exercises this
+  path end-to-end without manual setup.
 
 ## What it does (functional behaviour, valid in both tshark and GUI)
 
@@ -421,18 +438,27 @@ Produces `pcaps/generated/iccp-phase1.pcap` (~280 packets covering all
 A self-contained Python synthesizer (no libIEC61850, no network
 privileges) that produces an ICCP capture structurally similar to
 real-world utility-to-utility traffic — long-lived bilateral
-associations, cyclic Block-2 InformationReports at 1 / 4 / 60 s
-periods with float + quality-byte payloads, occasional Write-Request
-control commands, mix of CYCLIC and SPONTAN transfer sets — using a
-controlled fictional wordlist (peer codenames `AURORA`, `BLAZE`, …;
-domains like `AURORA_BLAZE`; datasets like `DS_ANA_M_Z_NRT`). RFC 5737
-documentation IPs only.
+associations, **`DefineNamedVariableList-Request` / `Response`
+exchange** that declares each Transfer Set with stable
+`(domain, listName, [variable items])`, then cyclic Block-2
+InformationReports at 1 / 4 / 60 s periods that reference those
+named data sets and carry float + quality-byte payloads,
+occasional Write-Request control commands, mix of CYCLIC and
+SPONTAN transfer sets — using a controlled fictional wordlist
+(peer codenames `AURORA`, `BLAZE`, …; domains like `AURORA_BLAZE`;
+datasets like `DS_ANA_M_Z_NRT`). RFC 5737 documentation IPs only.
 
 ```bash
 python3 scripts/gen-iccp-pcap.py -o pcaps/generated/iccp-fictional.pcap
 # default: 5 minutes simulated, 5 bilateral peers, ~2 400 packets
 python3 scripts/gen-iccp-pcap.py --duration 60 --seed 7 -o /tmp/short.pcap
 ```
+
+Because the DSD frames are on the wire, the dissector's auto-
+discovery (v0.6.1) populates `iccp.point.name` for every report
+out of the box — no UAT entry needed. Open the pcap in Wireshark
+and the Recovered-points subtree shows `→ <variable name>` on
+each row.
 
 The output is suitable for sharing as a sample capture, for
 demonstrating the dissector to ICCP engineers, or for regression

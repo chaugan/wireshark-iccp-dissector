@@ -4,11 +4,15 @@ gen-iccp-pcap.py — synthesize a realistic-but-fictional ICCP / TASE.2 pcap.
 
 Produces a legacy pcap with structurally realistic ICCP traffic:
   - 5 long-lived bilateral associations between fictional utility codenames
+  - Per-TS Data Set Definitions negotiated via DefineNamedVariableList
+    requests/responses right after Initiate (matches real session set-up)
+  - InformationReports whose AccessResult shape follows each TS's DSD
+    (slot N in the report = the variable at slot N in the DSD)
   - Cyclic InformationReports (Block 2 transfer sets) at 1 s / 4 s / 60 s
   - Spontaneous reports interleaved with the cyclic ones
   - Structured datasets carrying floats + TASE.2 quality bytes and status ints
   - A few Write-Request control commands (LFC ΔMW-style)
-  - Proper ACSE Initiate / Conclude bookends per association
+  - MMS Initiate / Conclude bookends per association
   - RFC 5737 documentation IPs (192.0.2.0/24, 198.51.100.0/24)
 
 Every peer codename, bilateral domain, dataset name, transfer set name and
@@ -163,6 +167,43 @@ def mms_write_request(invoke_id: int, domain_id: str, item_id: str,
     write_req   = ber(0xa5, var_spec + list_data)      # write [5] IMPLICIT
     inv         = ber_int(0x02, invoke_id)
     return ber(0xa0, inv + write_req)                  # confirmed-RequestPDU [0] IMPLICIT
+
+
+def mms_define_nvl_request(invoke_id: int,
+                           list_domain: str, list_item: str,
+                           variables: list[tuple[str, str]]) -> bytes:
+    # MMSpdu CHOICE: confirmed-RequestPDU [0] IMPLICIT
+    # ConfirmedServiceRequest CHOICE: defineNamedVariableList [11] IMPLICIT
+    # DefineNamedVariableList-Request ::= SEQUENCE {
+    #     variableListName    ObjectName,
+    #     listOfVariable [0] IMPLICIT SEQUENCE OF SEQUENCE {
+    #         variableSpecification    VariableSpecification,
+    #         alternateAccess     [5] IMPLICIT AlternateAccess OPTIONAL
+    #     }
+    # }
+    # VariableSpecification CHOICE: name [0] ObjectName (EXPLICIT)
+    list_name = mms_object_name_domain_specific(list_domain, list_item)
+    var_items = b''
+    for v_dom, v_item in variables:
+        var_obj   = mms_object_name_domain_specific(v_dom, v_item)
+        name_alt  = ber(0xa0, var_obj)              # VariableSpecification.name [0] EXPLICIT ObjectName
+        inner_seq = ber(0x30, name_alt)             # the wrapping SEQUENCE inside listOfVariable
+        var_items += inner_seq
+    list_of_var = ber(0xa0, var_items)              # listOfVariable [0] IMPLICIT
+    define_nvl  = ber(0xab, list_name + list_of_var)# [11] IMPLICIT DefineNamedVariableList-Request
+    inv         = ber_int(0x02, invoke_id)
+    return ber(0xa0, inv + define_nvl)              # confirmed-RequestPDU [0] IMPLICIT
+
+
+def mms_define_nvl_response(invoke_id: int) -> bytes:
+    # ConfirmedServiceResponse CHOICE:
+    #     defineNamedVariableList [11] IMPLICIT DefineNamedVariableList-Response
+    # DefineNamedVariableList-Response ::= NULL
+    # IMPLICIT replaces the universal NULL tag (0x05) with [11] context (0x8b),
+    # primitive, content empty.
+    nvl_resp = ber(0x8b, b'')
+    inv      = ber_int(0x02, invoke_id)
+    return ber(0xa1, inv + nvl_resp)               # confirmed-ResponsePDU [1] IMPLICIT
 
 
 def mms_initiate_request() -> bytes:
@@ -347,6 +388,39 @@ REGION_TOKENS = ['NORD', 'SUD', 'EST', 'OST', 'CTR', 'NRT', 'SRT']
 PLANT_TOKENS  = ['UNIT', 'BUS', 'LINE', 'XFMR', 'BKR', 'BAY']
 NUMBERS       = ['01', '02', '03', '04', '05', '11', '12', '21', '22']
 
+# Per-variable types in a Data Set Definition. Each TS's DSD is an
+# ordered list of (variable_name, var_type) tuples that determines (a)
+# what gets emitted in DefineNamedVariableList-Request at session set-up
+# and (b) the AccessResult shape inside every InformationReport for
+# that TS thereafter.
+VAR_HEADER_STR = 'header_str'   # visible-string carrying the TS name
+VAR_COUNTER    = 'counter'      # unsigned (sequence counter / status flag)
+VAR_ANALOG     = 'analog'       # struct(floating-point, bit-string-quality)
+VAR_STATUS     = 'status'       # struct(integer, bit-string-quality)
+
+
+def gen_dsd(rng: random.Random, ts_name: str, mode: str, kind: str) -> list:
+    """Build a stable Data Set Definition for one Transfer Set.
+
+    Returns a list of (var_name, var_type) tuples, in slot order.
+
+    Real-world DSDs typically start with a 1-2 item header (TS name +
+    sequence counter) followed by the actual point data; we mirror
+    that. The variable names are fictional but follow plausible
+    TASE.2 conventions.
+    """
+    dsd = [
+        (f'{ts_name}_NAME', VAR_HEADER_STR),
+        (f'{ts_name}_SEQ',  VAR_COUNTER),
+    ]
+    n_points  = rng.randint(3, 8)
+    pt_type   = VAR_ANALOG if kind == 'ANA' else VAR_STATUS
+    region    = rng.choice(REGION_TOKENS)
+    plant     = rng.choice(PLANT_TOKENS)
+    for i in range(n_points):
+        dsd.append((f'{ts_name}_{plant}_{region}_{i + 1:03d}', pt_type))
+    return dsd
+
 
 def fictional_dataset(rng: random.Random, kind: str) -> str:
     # kind in {'ANA','STAT','MIX'} matches DS_ANA_* / DS_STAT_* / DS_MIX_* style.
@@ -401,8 +475,18 @@ class Association:
         self.domain_ba = f'{b}_{a}'
 
         # Each direction has its own dataset + transfer-set namespace.
+        # Each TS now also carries a stable Data Set Definition (dsd) -- an
+        # ordered list of (var_name, var_type) tuples that determines what
+        # DefineNamedVariableList declares and what each InformationReport
+        # for the TS contains. Tuple shape is (ts_name, ds_id, period_s, dsd).
+        def _make_set(peer: str, mode: str, kind: str, period_s):
+            ts_name = fictional_transfer_set(rng, peer, mode)
+            ds_id   = fictional_dataset(rng, kind)
+            dsd     = gen_dsd(rng, ts_name, mode, kind)
+            return (ts_name, ds_id, period_s, dsd)
+
         self.client_to_hub_sets = [
-            (fictional_transfer_set(rng, client.name, mode), fictional_dataset(rng, kind), period_s)
+            _make_set(client.name, mode, kind, period_s)
             for (mode, kind, period_s) in [
                 ('CYCLIC',  'ANA',  4.0),
                 ('CYCLIC',  'STAT', 4.0),
@@ -410,13 +494,18 @@ class Association:
             ]
         ]
         self.hub_to_client_sets = [
-            (fictional_transfer_set(rng, hub.name, mode), fictional_dataset(rng, kind), period_s)
+            _make_set(hub.name, mode, kind, period_s)
             for (mode, kind, period_s) in [
                 ('CYCLIC',  'ANA',  1.0),
                 ('CYCLIC',  'STAT', 60.0),
                 ('SPONTAN', 'STAT', None),
             ]
         ]
+        # The client owns / publishes its TSes' DSDs in domain_ab; the
+        # hub does the same in domain_ba. (Real-world TASE.2 puts both
+        # parties' Data Sets in the bilateral table domain.)
+        self.invoke_id_c = 1
+        self.invoke_id_h = 1
 
     def _next_ident(self) -> int:
         v = self.ip_ident
@@ -465,42 +554,84 @@ class Association:
             t += 0.005
         return t
 
+    def define_dsds(self, t: float, pcap: PcapWriter) -> float:
+        """Emit DefineNamedVariableList-Request/Response for every TS the
+        client and hub publish. Real ICCP sessions negotiate (or
+        provision via vendor tooling) the data sets at session set-up
+        before reports start flowing; replicating that on the wire
+        gives the iccp plugin (and any analyst opening the pcap) the
+        slot-to-variable-name mapping for free, without requiring the
+        operator to populate the DSD UAT manually.
+        """
+        for c_to_h, sets in [(True, self.client_to_hub_sets),
+                             (False, self.hub_to_client_sets)]:
+            domain = self.domain_ab if c_to_h else self.domain_ba
+            for ts_name, ds_id, _period, dsd in sets:
+                if c_to_h:
+                    iv = self.invoke_id_c; self.invoke_id_c += 1
+                else:
+                    iv = self.invoke_id_h; self.invoke_id_h += 1
+                # Request: defines `ds_id` in `domain` and lists each
+                # variable with its (domain, var_name) pair. We use the
+                # same bilateral domain for every variable -- canonical
+                # TASE.2 puts all variables in the bilateral table.
+                variables = [(domain, var_name) for (var_name, _vt) in dsd]
+                req = mms_define_nvl_request(iv, domain, ds_id, variables)
+                tp = tpkt(cotp_dt(session_data_pdu(pres_user_data_mms(req))))
+                if c_to_h:
+                    f = self._emit(self.client, self.hub, self.sport, self.dport, 0x18, tp, True)
+                else:
+                    f = self._emit(self.hub, self.client, self.dport, self.sport, 0x18, tp, False)
+                pcap.write(t, f)
+                t += 0.005
+                # Response: peer ACKs the definition (NULL success body).
+                resp = mms_define_nvl_response(iv)
+                tp = tpkt(cotp_dt(session_data_pdu(pres_user_data_mms(resp))))
+                if c_to_h:
+                    f = self._emit(self.hub, self.client, self.dport, self.sport, 0x18, tp, False)
+                else:
+                    f = self._emit(self.client, self.hub, self.sport, self.dport, 0x18, tp, True)
+                pcap.write(t, f)
+                t += 0.005
+        return t
+
     def info_report(self, t: float, pcap: PcapWriter, c_to_h: bool,
-                    transfer_set: str, dataset: str, kind: str):
-        # Match the visible-item shape of real-world ICCP InformationReports.
-        # Wireshark's MMS dissector has a known recursion-depth bug
-        # (mms.c:2103) that stops parsing after roughly the second Data
-        # item in a SEQUENCE OF — so in practice the iccp dissector only
-        # sees items 1-2 of any report, regardless of how many points it
-        # actually carries. We emit the *first* AccessResult as the
-        # informative one (a header string, an analog point, or a status
-        # value) and follow it with a small tail so the report has plausible
-        # byte size on the wire.
-        shape = self.rng.choices(
-            ['header_str', 'analog', 'status', 'quality_only', 'empty'],
-            weights=[0.45, 0.25, 0.18, 0.10, 0.02],
-        )[0]
-        if shape == 'header_str':
-            first = mms_data_visible_string(transfer_set)
-        elif shape == 'analog':
-            first = mms_data_structure([
-                mms_data_floating_point(round(self.rng.uniform(-200.0, 5000.0), 3)),
-                mms_data_bit_string(self.rng.choice([0x80, 0xc0, 0x40, 0x00])),
-            ])
-        elif shape == 'status':
-            first = mms_data_structure([
-                mms_data_integer(self.rng.choice([0, 1, 2, 3])),
-                mms_data_bit_string(self.rng.choice([0x80, 0xc0, 0x40, 0x00])),
-            ])
-        elif shape == 'quality_only':
-            first = mms_data_bit_string(self.rng.choice([0x80, 0xc0, 0x40, 0x00]))
-        else:
-            first = mms_data_unsigned(self.rng.randint(1, 65535))
-        results = [mms_access_result_success(first)]
-        # Tail: 0-3 extra primitive items so reports vary in size on the wire
-        # without re-triggering the recursion bug at unhelpful offsets.
-        for _ in range(self.rng.randint(0, 3)):
-            results.append(mms_access_result_success(mms_data_unsigned(self.rng.randint(0, 255))))
+                    ts_name: str, dataset: str, dsd: list):
+        """Emit an InformationReport for `ts_name` whose AccessResult
+        list follows the TS's stable Data Set Definition. Each variable
+        in the DSD contributes one AccessResult; the type field
+        determines the encoding:
+
+          header_str -> visible-string carrying the TS name
+          counter    -> unsigned (sequence counter; randomised per frame)
+          analog     -> structure(float, bit-string-quality)
+          status     -> structure(integer, bit-string-quality)
+
+        Result: every report for the same TS has the same number and
+        shape of slots, just with different values -- matching real
+        bilateral table behaviour. The slot-to-variable-name mapping
+        from DefineNamedVariableList is therefore meaningful: slot N
+        in the report is the value of variable N in the DSD.
+        """
+        results = []
+        for var_name, vt in dsd:
+            if vt == VAR_HEADER_STR:
+                data = mms_data_visible_string(ts_name)
+            elif vt == VAR_COUNTER:
+                data = mms_data_unsigned(self.rng.randint(1, 65535))
+            elif vt == VAR_ANALOG:
+                data = mms_data_structure([
+                    mms_data_floating_point(round(self.rng.uniform(-200.0, 5000.0), 3)),
+                    mms_data_bit_string(self.rng.choice([0x80, 0xc0, 0x40, 0x00])),
+                ])
+            elif vt == VAR_STATUS:
+                data = mms_data_structure([
+                    mms_data_integer(self.rng.choice([0, 1, 2, 3])),
+                    mms_data_bit_string(self.rng.choice([0x80, 0xc0, 0x40, 0x00])),
+                ])
+            else:
+                data = mms_data_unsigned(0)
+            results.append(mms_access_result_success(data))
         domain = self.domain_ab if c_to_h else self.domain_ba
         mms = mms_information_report(domain, dataset, results)
         pres = pres_user_data_mms(mms)
@@ -553,43 +684,51 @@ def simulate(out_path: str, duration_s: float, seed: int):
         a.syn_handshake(base_ts + i * 0.05, pcap)
         associations.append(a)
 
-    # Initiate per association.
+    # Initiate per association, then immediately negotiate the Data Set
+    # Definitions (DefineNamedVariableList request/response per TS).
+    # Real ICCP sessions do this once at session set-up; placing them
+    # right after Initiate matches the typical wire pattern and gives
+    # any analyst opening the pcap the slot-to-variable-name mapping.
+    dsd_t = 0.0
     for i, a in enumerate(associations):
-        a.initiate(base_ts + 0.5 + i * 0.05, pcap)
+        end_t = a.initiate(base_ts + 0.5 + i * 0.05, pcap)
+        end_t = a.define_dsds(end_t, pcap)
+        if end_t > dsd_t:
+            dsd_t = end_t
 
     # Schedule cyclic + spontaneous reports for `duration_s` seconds of sim time.
     events: list[tuple[float, callable]] = []
     invoke_id = [1]
 
     def schedule_cyclic(a: Association, c_to_h: bool, ts: tuple):
-        name, dataset, period = ts
+        name, dataset, period, dsd = ts
         if period is None:
             return
-        # First fire 1.0 s after Initiate ends; then every period seconds.
-        t = base_ts + 2.0 + rng.uniform(0, period)
-        kind = 'ANA' if 'ANA' in dataset else 'STAT'
+        # First fire `period` after the DSDs are negotiated; then every
+        # `period` seconds. Starting after dsd_t means the first report
+        # always reflects a TS the partner has already declared.
+        t = dsd_t + period + rng.uniform(0, period)
         while t < base_ts + duration_s:
-            events.append((t, lambda tt=t, ak=a, ch=c_to_h, n=name, d=dataset, k=kind:
-                           ak.info_report(tt, pcap, ch, n, d, k)))
+            events.append((t, lambda tt=t, ak=a, ch=c_to_h, n=name, d=dataset, ds=dsd:
+                           ak.info_report(tt, pcap, ch, n, d, ds)))
             t += period
 
     def schedule_spontaneous(a: Association, c_to_h: bool, ts: tuple, rate_per_min: float):
-        name, dataset, _ = ts
-        kind = 'ANA' if 'ANA' in dataset else 'STAT'
+        name, dataset, _period, dsd = ts
         # Poisson-ish: small probability each second.
-        t = base_ts + 5.0
+        t = dsd_t + 5.0
         end = base_ts + duration_s
         while t < end:
             gap = rng.expovariate(rate_per_min / 60.0)
             t += gap
             if t >= end:
                 break
-            events.append((t, lambda tt=t, ak=a, ch=c_to_h, n=name, d=dataset, k=kind:
-                           ak.info_report(tt, pcap, ch, n, d, k)))
+            events.append((t, lambda tt=t, ak=a, ch=c_to_h, n=name, d=dataset, ds=dsd:
+                           ak.info_report(tt, pcap, ch, n, d, ds)))
 
     def schedule_writes(a: Association):
         # Client sends a few bilateral set-points across the run.
-        t = base_ts + 30.0
+        t = dsd_t + 30.0
         end = base_ts + duration_s
         while t < end:
             t += rng.uniform(45.0, 90.0)
