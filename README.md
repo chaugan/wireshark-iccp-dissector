@@ -454,11 +454,20 @@ python3 scripts/gen-iccp-pcap.py -o pcaps/generated/iccp-fictional.pcap
 python3 scripts/gen-iccp-pcap.py --duration 60 --seed 7 -o /tmp/short.pcap
 ```
 
-Because the DSD frames are on the wire, the dissector's auto-
-discovery (v0.6.1) populates `iccp.point.name` for every report
-out of the box — no UAT entry needed. Open the pcap in Wireshark
-and the Recovered-points subtree shows `→ <variable name>` on
-each row.
+Because the synthetic capture is generated from scratch, the
+`DefineNamedVariableList-Request` frames are guaranteed to be on
+the wire — the dissector's auto-discovery (v0.6.1) keys off them
+to populate `iccp.point.name` on every subsequent report, with no
+UAT entry needed.
+
+The same auto-discovery applies to **any pcap that includes the
+DSD negotiation**. If your real-world capture covers the start of
+the association — or includes a later renegotiation — the
+slot → name mapping is built automatically as those PDUs go past.
+Captures that started mid-session and missed the negotiation get
+no auto-discovery (the dissector cannot reconstruct what it never
+saw), so the UAT in *Edit → Preferences → Protocols → ICCP →
+DSD Mapping* remains the fallback for those.
 
 The output is suitable for sharing as a sample capture, for
 demonstrating the dissector to ICCP engineers, or for regression
