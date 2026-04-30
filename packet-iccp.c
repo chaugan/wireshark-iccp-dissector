@@ -156,6 +156,16 @@ static int hf_iccp_point_summary     = -1;
 static int hf_iccp_point_value       = -1;
 static int hf_iccp_point_quality     = -1;
 static int hf_iccp_point_index       = -1;
+static int hf_iccp_point_slot        = -1;
+static int hf_iccp_point_name        = -1;
+
+/* Forward declaration: the user-supplied DSD-mapping UAT lives further
+ * down in the file (next to its registration in proto_register_iccp);
+ * dissect_iccp calls iccp_dsd_lookup from the recovered-points subtree
+ * builder. */
+static const char *iccp_dsd_lookup(const char *domain,
+                                   const char *transfer_set,
+                                   guint32 slot);
 
 static gint ett_iccp         = -1;
 static gint ett_iccp_objects = -1;
@@ -770,7 +780,13 @@ walk_tree(packet_info *pinfo _U_, proto_tree *tree,
          * mms.success_element, so we derive the success count as
          * total AccessResult items minus failure count. */
         else if (!strcmp(s, "failure"))             flags->failure_count++;
-        else if (!strcmp(s, "structure_element"))   flags->structure_count++;
+        /* MMS emits the structure-count item under abbrev "mms.structure"
+         * in 4.2.x and 4.6 alike (verified empirically via -T fields).
+         * The duplicate hf "mms.structure_element" exists in the asn2wrs
+         * registration table but is never actually emitted, at least in
+         * the 4.2.2 / 4.2.3 dissector. Match both names for safety. */
+        else if (!strcmp(s, "structure") || !strcmp(s, "structure_element"))
+            flags->structure_count++;
         else if (!strcmp(s, "floating_point"))      flags->floating_point_count++;
         else if (!strcmp(s, "data_bit-string"))     flags->bit_string_count++;
         else if (!strcmp(s, "data.binary-time"))    flags->binary_time_count++;
@@ -865,6 +881,14 @@ typedef struct {
      * still get the aggregate min/max/sum on the tap). */
     wmem_array_t *point_values;       /* gfloat per element */
     wmem_array_t *point_validities;   /* guint8 per element, 0..3 */
+    /* Slot of each point in the parent listOfAccessResult. Filled by the
+     * BER walker, which is the only path that knows the wire-position.
+     * The proto-tree walk path (attach_decoded_values) doesn't populate
+     * this array -- on a Wireshark version with the MMS bug it has at
+     * most one entry to fill anyway. Length matches point_values when
+     * the BER walker provided the points; may be 0 when only the tree
+     * walk fed point_values. */
+    wmem_array_t *point_slots;        /* guint32 per element */
     /* When TRUE, the walker collects counters and per-point arrays but
      * does NOT mutate the proto tree (no [Decoded float], no [Quality
      * decoded], no Point #N synthesis rows). Used by the always-on
@@ -873,6 +897,14 @@ typedef struct {
      * re-added them would duplicate every Point #N row in the GUI
      * detail pane. */
     gboolean read_only;
+    /* Tree the BER walker emits hidden iccp.point.value /
+     * iccp.point.quality items into, so display filters that reference
+     * those fields match every frame -- even in non-visible tree mode
+     * (Wireshark GUI's filter scan, tshark -2 default summary) where
+     * MMS items are faked out and attach_decoded_values' tree walk
+     * finds nothing to synthesise from. NULL means "don't emit hidden
+     * items"; the BER walker still updates counters and arrays. */
+    proto_tree *hidden_tree;
 } iccp_walk_ctx_t;
 
 static void attach_decoded_values(proto_node *node, gpointer user_data);
@@ -968,9 +1000,12 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
                                                 line);
         proto_item_set_generated(pit);
         proto_tree *psub = proto_item_add_subtree(pit, ett_iccp_point);
-        proto_item *vi = proto_tree_add_float(psub, hf_iccp_point_value,
-                                              fp_fi->ds_tvb, fp_fi->start,
-                                              fp_fi->length, v);
+        /* Promote to double so Wireshark's `iccp.point.value == <displayed>`
+         * filter matches: single-precision would round-trip through display
+         * formatting and lose the literal that the right-click suggests. */
+        proto_item *vi = proto_tree_add_double(psub, hf_iccp_point_value,
+                                               fp_fi->ds_tvb, fp_fi->start,
+                                               fp_fi->length, (gdouble)v);
         proto_item_set_generated(vi);
         proto_item *qi = proto_tree_add_string(psub, hf_iccp_point_quality,
                                                bs_fi->ds_tvb, bs_fi->start,
@@ -1057,9 +1092,9 @@ maybe_decode_float(proto_node *node)
 
     gfloat val = tvb_get_ntohieee_float(fi->ds_tvb, fi->start + 1);
     proto_tree *sub = proto_item_add_subtree(node, ett_iccp_value);
-    proto_item *it = proto_tree_add_float(sub, hf_iccp_value_real,
-                                          fi->ds_tvb, fi->start,
-                                          fi->length, val);
+    proto_item *it = proto_tree_add_double(sub, hf_iccp_value_real,
+                                           fi->ds_tvb, fi->start,
+                                           fi->length, (gdouble)val);
     proto_item_set_generated(it);
 }
 
@@ -1156,9 +1191,10 @@ iccp_quality_validity_class(guint8 q)
 }
 
 static void
-iccp_ber_walk_one_data(guint8 tag, const guint8 *content, guint32 len,
+iccp_ber_walk_one_data(tvbuff_t *tvb, const guint8 *base, guint8 tag,
+                       const guint8 *content, guint32 len,
                        iccp_pdu_flags_t *flags, iccp_walk_ctx_t *walk_ctx,
-                       int depth)
+                       int depth, guint32 slot)
 {
     if (depth > 16) return;
     switch (tag) {
@@ -1166,13 +1202,34 @@ iccp_ber_walk_one_data(guint8 tag, const guint8 *content, guint32 len,
             break;
         case 0x84: /* bit-string [4] */
             flags->bit_string_count++;
-            if (len >= 2 && walk_ctx && walk_ctx->point_validities) {
+            if (len >= 2 && walk_ctx) {
                 /* content[0] is the unused-bits count; the quality byte is
                  * the next byte. Append the validity class, matching the
                  * mapping the proto-tree-driven path uses. */
                 guint8 q  = content[1];
                 guint8 vc = iccp_quality_validity_class(q);
-                wmem_array_append_one(walk_ctx->point_validities, vc);
+                if (walk_ctx->point_validities) {
+                    wmem_array_append_one(walk_ctx->point_validities, vc);
+                }
+                /* Hidden filter-target items so iccp.quality.* and
+                 * iccp.quality match in the GUI's filter scan even when
+                 * the tree is in non-visible mode and MMS items are
+                 * faked away. proto_tree_add_*() honours HF_REF_TYPE_DIRECT
+                 * to bypass the fake check, and any filter that mentions
+                 * the field marks it direct-ref. */
+                if (walk_ctx->hidden_tree && tvb && base) {
+                    int offset = (int)(content - base);
+                    proto_item *qi = proto_tree_add_uint(walk_ctx->hidden_tree,
+                                                         hf_iccp_quality,
+                                                         tvb, offset + 1, 1, q);
+                    proto_item_set_hidden(qi);
+                    proto_item_set_generated(qi);
+                    proto_item *vi = proto_tree_add_uint(walk_ctx->hidden_tree,
+                                                         hf_iccp_quality_validity,
+                                                         tvb, offset + 1, 1, q);
+                    proto_item_set_hidden(vi);
+                    proto_item_set_generated(vi);
+                }
             }
             break;
         case 0x85: /* integer [5] */
@@ -1180,7 +1237,7 @@ iccp_ber_walk_one_data(guint8 tag, const guint8 *content, guint32 len,
             break;
         case 0x87: /* floating-point [7] */
             flags->floating_point_count++;
-            if (len >= 5 && walk_ctx && walk_ctx->point_values) {
+            if (len >= 5 && walk_ctx) {
                 /* TASE.2 floating-point: 1-byte exponent indicator at
                  * content[0] (8 = IEEE-754 single, 11 = double), then
                  * 4 bytes IEEE-754 BE for single. We only handle single
@@ -1191,7 +1248,31 @@ iccp_ber_walk_one_data(guint8 tag, const guint8 *content, guint32 len,
                             |  (guint32)content[4];
                 gfloat f;
                 memcpy(&f, &raw, 4);
-                wmem_array_append_one(walk_ctx->point_values, f);
+                if (walk_ctx->point_values) {
+                    wmem_array_append_one(walk_ctx->point_values, f);
+                }
+                if (walk_ctx->point_slots) {
+                    wmem_array_append_one(walk_ctx->point_slots, slot);
+                }
+                /* Hidden filter-target item. See bit-string case above
+                 * for the rationale; this is what makes
+                 * `iccp.point.value > 0` and `AVG(iccp.point.value)` work
+                 * in the GUI. */
+                if (walk_ctx->hidden_tree && tvb && base) {
+                    int offset = (int)(content - base);
+                    proto_item *vi = proto_tree_add_double(walk_ctx->hidden_tree,
+                                                           hf_iccp_point_value,
+                                                           tvb, offset + 1, 4,
+                                                           (gdouble)f);
+                    proto_item_set_hidden(vi);
+                    proto_item_set_generated(vi);
+                    proto_item *ri = proto_tree_add_double(walk_ctx->hidden_tree,
+                                                           hf_iccp_value_real,
+                                                           tvb, offset + 1, 4,
+                                                           (gdouble)f);
+                    proto_item_set_hidden(ri);
+                    proto_item_set_generated(ri);
+                }
             }
             break;
         case 0x89: /* octet-string [9] */
@@ -1211,7 +1292,11 @@ iccp_ber_walk_one_data(guint8 tag, const guint8 *content, guint32 len,
                 while (p < end) {
                     guint8 t; guint32 l;
                     if (!iccp_ber_read_tl(&p, end, &t, &l)) break;
-                    iccp_ber_walk_one_data(t, p, l, flags, walk_ctx, depth + 1);
+                    /* Children of a structure inherit the parent's slot
+                     * — they're sub-fields of the same listOfAccessResult
+                     * item, not separate top-level slots. */
+                    iccp_ber_walk_one_data(tvb, base, t, p, l,
+                                           flags, walk_ctx, depth + 1, slot);
                     p += l;
                 }
             }
@@ -1227,7 +1312,8 @@ iccp_ber_walk_one_data(guint8 tag, const guint8 *content, guint32 len,
  * dispatch: AccessResult.failure is [0] IMPLICIT (tag 0x80 / 0xa0) while
  * AccessResult.success is bare Data. */
 static void
-iccp_ber_walk_seq_of(const guint8 *content, guint32 len,
+iccp_ber_walk_seq_of(tvbuff_t *tvb, const guint8 *base,
+                     const guint8 *content, guint32 len,
                      iccp_pdu_flags_t *flags, iccp_walk_ctx_t *walk_ctx,
                      gboolean is_access_result)
 {
@@ -1238,11 +1324,12 @@ iccp_ber_walk_seq_of(const guint8 *content, guint32 len,
     while (p < end) {
         guint8 t; guint32 l;
         if (!iccp_ber_read_tl(&p, end, &t, &l)) break;
+        guint32 slot = items;       /* 0-based listOfAccessResult slot */
         items++;
         if (is_access_result && (t == 0x80 || t == 0xa0)) {
             failures++;
         } else {
-            iccp_ber_walk_one_data(t, p, l, flags, walk_ctx, 0);
+            iccp_ber_walk_one_data(tvb, base, t, p, l, flags, walk_ctx, 0, slot);
         }
         p += l;
     }
@@ -1280,7 +1367,7 @@ iccp_ber_recover(tvbuff_t *tvb, iccp_pdu_flags_t *flags, iccp_walk_ctx_t *walk_c
         /* listOfAccessResult [0] IMPLICIT (A0) */
         if (!iccp_ber_read_tl(&p, ir_end, &t, &l)) return;
         if (t != 0xa0) return;
-        iccp_ber_walk_seq_of(p, l, flags, walk_ctx, TRUE);
+        iccp_ber_walk_seq_of(tvb, base, p, l, flags, walk_ctx, TRUE);
         return;
     }
     if (top_tag == 0xa0) {
@@ -1298,7 +1385,7 @@ iccp_ber_recover(tvbuff_t *tvb, iccp_pdu_flags_t *flags, iccp_walk_ctx_t *walk_c
             p += l2;
             if (!iccp_ber_read_tl(&p, wr_end, &t2, &l2)) return;
             if (t2 != 0xa0) return;
-            iccp_ber_walk_seq_of(p, l2, flags, walk_ctx, FALSE);
+            iccp_ber_walk_seq_of(tvb, base, p, l2, flags, walk_ctx, FALSE);
         }
         return;
     }
@@ -1318,7 +1405,7 @@ iccp_ber_recover(tvbuff_t *tvb, iccp_pdu_flags_t *flags, iccp_walk_ctx_t *walk_c
                 const guint8 *before = p;
                 if (!iccp_ber_read_tl(&p, rd_end, &t2, &l2)) return;
                 if (t2 == 0xa1) {
-                    iccp_ber_walk_seq_of(p, l2, flags, walk_ctx, TRUE);
+                    iccp_ber_walk_seq_of(tvb, base, p, l2, flags, walk_ctx, TRUE);
                     return;
                 }
                 p = before;
@@ -1350,6 +1437,23 @@ typedef struct {
     gboolean            dev_stale_select;
     iccp_walk_ctx_t     walk_ctx;
     gboolean            surface;
+    /* TRUE when the BER walker recovered more points / AccessResult
+     * items than walk_tree found in the MMS proto tree. That means
+     * Wireshark's MMS dissector aborted mid-list on this frame -- the
+     * recursion-depth assertion at packet-mms.c:dissect_mms_Data fired
+     * (the bug present in Wireshark 4.2.0 / 4.2.1 / 4.2.2; fixed in
+     * 4.2.3 and later). On versions with the upstream fix in place,
+     * MMS dissects everything and this flag stays FALSE -- the
+     * "Recovered points" subtree we emit is then a parallel view of
+     * the same data, not a recovery from a truncated tree. */
+    gboolean            mms_truncated;
+    /* Diagnostic: per-axis counts seen by walk_tree (MMS proto tree)
+     * and by iccp_ber_recover (raw bytes). The truncated flag is true
+     * iff any BER count exceeds its tree counterpart. Surfaced in the
+     * recovered-subtree header so a mis-detection is debuggable from
+     * a screenshot without rebuilding. */
+    guint32             tree_ar, tree_str, tree_flt, tree_bs;
+    guint32             ber_ar,  ber_str,  ber_flt,  ber_bs;
 } iccp_analysis_t;
 
 static gboolean
@@ -1366,6 +1470,7 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
     out->walk_ctx.read_only        = read_only;
     out->walk_ctx.point_values     = wmem_array_new(array_scope, sizeof(gfloat));
     out->walk_ctx.point_validities = wmem_array_new(array_scope, sizeof(guint8));
+    out->walk_ctx.point_slots      = wmem_array_new(array_scope, sizeof(guint32));
     if (out->flags.floating_point_count > 0
         || out->flags.bit_string_count   > 0
         || out->flags.structure_count    > 0) {
@@ -1391,7 +1496,39 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
         memset(&ber_ctx,   0, sizeof ber_ctx);
         ber_ctx.point_values     = wmem_array_new(array_scope, sizeof(gfloat));
         ber_ctx.point_validities = wmem_array_new(array_scope, sizeof(guint8));
+        ber_ctx.point_slots      = wmem_array_new(array_scope, sizeof(guint32));
+        /* Make the BER walker emit hidden iccp.point.value /
+         * iccp.quality items into the same tree we were given. Hidden
+         * means they don't show in the proto tree pane (the visible
+         * Point #N rows from attach_decoded_values handle that), but
+         * they ARE filterable -- which is what makes
+         * `iccp.point.value > 0` and `AVG(iccp.point.value)` work in
+         * the GUI's filter scan and I/O Graphs even when the tree is
+         * in non-visible mode and MMS items are faked away. */
+        ber_ctx.hidden_tree = tree;
         iccp_ber_recover(tvb, &ber_flags, &ber_ctx);
+
+        /* Detect MMS truncation by comparing what walk_tree found in
+         * the MMS proto tree vs what the BER walker found in the raw
+         * bytes. If BER reports more access results / floats than the
+         * tree path saw, MMS aborted mid-list -- the recursion-depth
+         * bug in Wireshark <= 4.2.2's dissect_mms_Data fired. On
+         * Wireshark 4.2.3+ the bug is fixed, the tree has every
+         * AccessResult, and this flag stays FALSE. */
+        out->tree_ar  = out->flags.access_result_count;
+        out->tree_str = out->flags.structure_count;
+        out->tree_flt = out->flags.floating_point_count;
+        out->tree_bs  = out->flags.bit_string_count;
+        out->ber_ar   = ber_flags.access_result_count;
+        out->ber_str  = ber_flags.structure_count;
+        out->ber_flt  = ber_flags.floating_point_count;
+        out->ber_bs   = ber_flags.bit_string_count;
+        if (ber_flags.access_result_count   > out->flags.access_result_count   ||
+            ber_flags.floating_point_count  > out->flags.floating_point_count  ||
+            ber_flags.bit_string_count      > out->flags.bit_string_count      ||
+            ber_flags.structure_count       > out->flags.structure_count) {
+            out->mms_truncated = TRUE;
+        }
 
         #define ICCP_MAX_FIELD(f)  do { \
             if (ber_flags.f > out->flags.f) out->flags.f = ber_flags.f; \
@@ -1410,6 +1547,11 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
         guint tree_pv_n = wmem_array_get_count(out->walk_ctx.point_values);
         if (ber_pv_n > tree_pv_n) {
             out->walk_ctx.point_values = ber_ctx.point_values;
+        }
+        guint ber_ps_n = wmem_array_get_count(ber_ctx.point_slots);
+        guint tree_ps_n = wmem_array_get_count(out->walk_ctx.point_slots);
+        if (ber_ps_n > tree_ps_n) {
+            out->walk_ctx.point_slots = ber_ctx.point_slots;
         }
         guint ber_pq_n = wmem_array_get_count(ber_ctx.point_validities);
         guint tree_pq_n = wmem_array_get_count(out->walk_ctx.point_validities);
@@ -1668,6 +1810,25 @@ iccp_dispatch_via_oid(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void 
         col_clear(pinfo->cinfo, COL_INFO);
     }
 
+    /* Override the Protocol column unconditionally, REGARDLESS of whether
+     * `tree` is non-NULL. The Wireshark GUI's first-pass packet-list
+     * render passes tree=NULL as a performance optimization (even with
+     * a TL_REQUIRES_PROTO_TREE tap on "frame"), which makes dissect_iccp
+     * below bail on its !tree guard before its own col_set_str runs.
+     * Doing the column write here -- in the OID-level wrapper, with the
+     * full pinfo context but no tree dependency -- makes the column
+     * read "ICCP" on every frame the wrapper fires, including the
+     * first-pass scan that populates the packet list at file open.
+     *
+     * The fence locks the column so a second MMS dispatch on a
+     * reassembled segment, or any other late writer, can't revert it
+     * to "MMS/IEC61850". */
+    col_set_writable(pinfo->cinfo, COL_PROTOCOL, TRUE);
+    col_clear_fence(pinfo->cinfo, COL_PROTOCOL);
+    col_clear(pinfo->cinfo, COL_PROTOCOL);
+    col_set_str(pinfo->cinfo, COL_PROTOCOL, "ICCP");
+    col_set_fence(pinfo->cinfo, COL_PROTOCOL);
+
     /* Run the existing analysis. dissect_iccp checks the de-dup flag
      * at entry so we mark the frame AFTER calling it -- the flag means
      * "post-dissector skip me, the OID-level wrapper handled this". */
@@ -1711,11 +1872,12 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
      * Clearing it loses MMS's text in the GUI even though our
      * subsequent append never reaches the GUI's column cache. */
     col_set_writable(pinfo->cinfo, -1,           TRUE);
-    col_set_writable(pinfo->cinfo, COL_PROTOCOL, TRUE);
     col_set_writable(pinfo->cinfo, COL_INFO,     TRUE);
-    col_clear_fence(pinfo->cinfo, COL_PROTOCOL);
-    col_clear(pinfo->cinfo, COL_PROTOCOL);
-    col_set_str(pinfo->cinfo, COL_PROTOCOL, "ICCP");
+    /* COL_PROTOCOL was already set + fenced by iccp_dispatch_via_oid in
+     * the OID-wrapper path so the GUI's first-pass packet-list render
+     * (which passes tree=NULL and would have bailed before reaching us)
+     * still gets the right column. The fence is in place; nothing here
+     * needs to write COL_PROTOCOL again. */
 
     /* Info column: <Op> on <Object>: <Name> */
     {
@@ -1829,6 +1991,106 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
         proto_item *sumit = proto_tree_add_string(itree, hf_iccp_report_summary,
                                                   tvb, 0, 0, summary);
         proto_item_set_generated(sumit);
+
+        /* Recovered points subtree. The MMS dissector aborts at item ~2
+         * of any SEQUENCE OF Data due to mms.c:2103, so the proto-tree
+         * pane only shows 1-2 of the actual N AccessResult items even
+         * for reports carrying tens or hundreds of points. The BER
+         * walker has the full list in walk_ctx.point_values /
+         * point_validities; iterate them here to give the user a
+         * visible per-point listing under the iccp tree, since the
+         * native MMS subtree is truncated. */
+        guint np = a.walk_ctx.point_values
+                   ? wmem_array_get_count(a.walk_ctx.point_values)     : 0;
+        guint nq = a.walk_ctx.point_validities
+                   ? wmem_array_get_count(a.walk_ctx.point_validities) : 0;
+        guint ns = a.walk_ctx.point_slots
+                   ? wmem_array_get_count(a.walk_ctx.point_slots)      : 0;
+        if (np > 0) {
+            char header[256];
+            if (a.mms_truncated) {
+                g_snprintf(header, sizeof header,
+                           "Recovered points: %u — MMS truncated this frame "
+                           "(tree: AR=%u struct=%u flt=%u bs=%u | BER: AR=%u "
+                           "struct=%u flt=%u bs=%u). dissect_mms_Data "
+                           "recursion-depth bug, fixed upstream in 4.2.3.",
+                           np,
+                           a.tree_ar, a.tree_str, a.tree_flt, a.tree_bs,
+                           a.ber_ar,  a.ber_str,  a.ber_flt,  a.ber_bs);
+            } else {
+                g_snprintf(header, sizeof header,
+                           "Per-point listing: %u (parallel view of MMS "
+                           "listOfAccessResult; counts agree tree=BER: AR=%u "
+                           "struct=%u flt=%u bs=%u — iccp.point.* fields "
+                           "filterable + I/O-graphable)",
+                           np, a.ber_ar, a.ber_str, a.ber_flt, a.ber_bs);
+            }
+            proto_item *rh = proto_tree_add_string(itree, hf_iccp_note,
+                                                   tvb, 0, 0, header);
+            proto_item_set_generated(rh);
+            proto_tree *rsub = proto_item_add_subtree(rh, ett_iccp_point);
+            /* One subtree per recovered point, each carrying filterable
+             * children: iccp.point.index (uint), iccp.point.value (double),
+             * iccp.point.quality (string). Right-click on any child to
+             * apply / build a filter; the values feed I/O graphs via
+             * iccp.point.value.
+             *
+             * A single-line "Point #N: <value> [VALIDITY]" parent row
+             * gives a quick visual scan; expand for the structured
+             * sub-fields. */
+            for (guint i = 0; i < np; i++) {
+                gfloat fv = *(gfloat *)wmem_array_index(a.walk_ctx.point_values, i);
+                const char *vc_str = "?";
+                if (i < nq) {
+                    guint8 vc = *(guint8 *)wmem_array_index(a.walk_ctx.point_validities, i);
+                    vc_str = (vc == 0) ? "VALID"   :
+                             (vc == 1) ? "HELD"    :
+                             (vc == 2) ? "SUSPECT" :
+                                         "NOT_VALID";
+                }
+                char line[96];
+                g_snprintf(line, sizeof line,
+                           "Point #%u: %.6g [%s]", i + 1, (double)fv, vc_str);
+                proto_item *pit = proto_tree_add_string(rsub, hf_iccp_point_summary,
+                                                        tvb, 0, 0, line);
+                proto_item_set_generated(pit);
+                proto_tree *psub = proto_item_add_subtree(pit, ett_iccp_point);
+
+                proto_item *xi = proto_tree_add_uint(psub, hf_iccp_point_index,
+                                                     tvb, 0, 0, i + 1);
+                proto_item_set_generated(xi);
+                guint32 slot = (guint32)-1;
+                if (i < ns) {
+                    slot = *(guint32 *)wmem_array_index(a.walk_ctx.point_slots, i);
+                    proto_item *si = proto_tree_add_uint(psub, hf_iccp_point_slot,
+                                                         tvb, 0, 0, slot);
+                    proto_item_set_generated(si);
+                    /* Look up the variable name for this slot from the
+                     * user-supplied DSD mapping (Edit -> Preferences ->
+                     * Protocols -> ICCP -> DSD Mapping). Surface as
+                     * iccp.point.name so analysts can right-click /
+                     * Apply as Filter on a meaningful label. */
+                    const char *vname = iccp_dsd_lookup(
+                        a.scan.domain_id ? a.scan.domain_id : "",
+                        a.scan.matched_name ? a.scan.matched_name : "",
+                        slot);
+                    if (vname) {
+                        proto_item *ni = proto_tree_add_string(psub, hf_iccp_point_name,
+                                                               tvb, 0, 0, vname);
+                        proto_item_set_generated(ni);
+                        /* Update the parent row text so the name shows
+                         * inline without needing to expand. */
+                        proto_item_append_text(pit, "  →  %s", vname);
+                    }
+                }
+                proto_item *vi = proto_tree_add_double(psub, hf_iccp_point_value,
+                                                       tvb, 0, 0, (gdouble)fv);
+                proto_item_set_generated(vi);
+                proto_item *qi = proto_tree_add_string(psub, hf_iccp_point_quality,
+                                                       tvb, 0, 0, vc_str);
+                proto_item_set_generated(qi);
+            }
+        }
     }
 
     /* Device sub-tree. */
@@ -2092,6 +2354,110 @@ iccp_stats_tree_packet(stats_tree *st,
 }
 
 /* -------------------------------------------------------------------------
+ * Data Set Definition mapping (UAT)
+ *
+ * MMS InformationReports identify each value only by its position in
+ * listOfAccessResult -- no per-point name on the wire. The mapping
+ * "slot -> variable name" lives in the bilateral table / Data Set
+ * Definition that the peers negotiated at session setup.
+ *
+ * If the capture covered the negotiation, our DefineNamedVariableList
+ * auto-capture (next section) will populate the mapping automatically.
+ * For mid-session captures (the common case for utility operators
+ * dropping a tap on a long-lived link), the operator can paste the
+ * mapping into the GUI: Edit -> Preferences -> Protocols -> ICCP ->
+ * "DSD Mapping". One row per (domain, transfer set, slot, name).
+ *
+ * Lookup is O(N * rows) per point; we expect a few thousand rows at
+ * most (one row per point in a few transfer sets), so a linear scan is
+ * fine. If a deployment ends up with tens of thousands of rows, switch
+ * to a hash table keyed by (domain, transfer_set).
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+    char    *domain;
+    char    *transfer_set;
+    guint32  slot;          /* must be guint32 -- UAT_DEC_CB_DEF calls ws_strtou32 */
+    char    *var_name;
+} iccp_dsd_record_t;
+
+static iccp_dsd_record_t *iccp_dsd_records       = NULL;
+static guint              iccp_dsd_records_count = 0;
+
+UAT_CSTRING_CB_DEF(iccp_dsd, domain,       iccp_dsd_record_t)
+UAT_CSTRING_CB_DEF(iccp_dsd, transfer_set, iccp_dsd_record_t)
+UAT_DEC_CB_DEF(    iccp_dsd, slot,         iccp_dsd_record_t)
+UAT_CSTRING_CB_DEF(iccp_dsd, var_name,     iccp_dsd_record_t)
+
+static void *
+iccp_dsd_copy_cb(void *dst_, const void *src_, size_t len _U_)
+{
+    iccp_dsd_record_t       *d = (iccp_dsd_record_t *)dst_;
+    const iccp_dsd_record_t *s = (const iccp_dsd_record_t *)src_;
+    d->domain       = g_strdup(s->domain);
+    d->transfer_set = g_strdup(s->transfer_set);
+    d->slot         = s->slot;
+    d->var_name     = g_strdup(s->var_name);
+    return d;
+}
+
+static bool
+iccp_dsd_update_cb(void *r, char **err)
+{
+    iccp_dsd_record_t *rec = (iccp_dsd_record_t *)r;
+    if (!rec->domain || !*rec->domain) {
+        *err = g_strdup("Domain is required");
+        return FALSE;
+    }
+    if (!rec->transfer_set || !*rec->transfer_set) {
+        *err = g_strdup("Transfer Set is required");
+        return FALSE;
+    }
+    if (!rec->var_name || !*rec->var_name) {
+        *err = g_strdup("Variable Name is required");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void
+iccp_dsd_free_cb(void *r)
+{
+    iccp_dsd_record_t *rec = (iccp_dsd_record_t *)r;
+    g_free(rec->domain);
+    g_free(rec->transfer_set);
+    g_free(rec->var_name);
+}
+
+static uat_field_t iccp_dsd_fields[] = {
+    UAT_FLD_CSTRING(iccp_dsd, domain,       "Domain",
+        "Bilateral domain (the domainId in domain-specific ObjectName)."),
+    UAT_FLD_CSTRING(iccp_dsd, transfer_set, "Transfer Set",
+        "Transfer Set / Data Set name (the itemId)."),
+    UAT_FLD_DEC(    iccp_dsd, slot,         "Slot",
+        "0-based listOfAccessResult slot (matches iccp.point.slot)."),
+    UAT_FLD_CSTRING(iccp_dsd, var_name,     "Variable Name",
+        "Human-readable name for the point at this slot."),
+    UAT_END_FIELDS
+};
+
+/* Look up the variable name for a point. Returns NULL if no mapping. */
+static const char *
+iccp_dsd_lookup(const char *domain, const char *transfer_set, guint32 slot)
+{
+    if (!domain || !transfer_set) return NULL;
+    for (guint i = 0; i < iccp_dsd_records_count; i++) {
+        const iccp_dsd_record_t *r = &iccp_dsd_records[i];
+        if (r->slot == slot
+            && g_strcmp0(r->domain,       domain)       == 0
+            && g_strcmp0(r->transfer_set, transfer_set) == 0) {
+            return r->var_name;
+        }
+    }
+    return NULL;
+}
+
+/* -------------------------------------------------------------------------
  * Protocol registration
  * ---------------------------------------------------------------------- */
 
@@ -2192,9 +2558,9 @@ proto_register_iccp(void)
         },
         { &hf_iccp_value_real,
           { "Decoded float", "iccp.value.real",
-            FT_FLOAT, BASE_NONE, NULL, 0x0,
+            FT_DOUBLE, BASE_NONE, NULL, 0x0,
             "MMS floating-point primitive decoded to IEEE 754 single-"
-            "precision. The MMS dissector shows these as raw bytes "
+            "precision. The MMS dissector shows these as raw bytes"
             "because the 1-byte exponent-width prefix is unusual; this "
             "field exposes the actual numeric value.",
             HFILL }
@@ -2242,8 +2608,10 @@ proto_register_iccp(void)
         },
         { &hf_iccp_point_value,
           { "Value", "iccp.point.value",
-            FT_FLOAT, BASE_NONE, NULL, 0x0,
-            "Decoded numeric value of the point.",
+            FT_DOUBLE, BASE_NONE, NULL, 0x0,
+            "Decoded numeric value of the point. Stored as double so "
+            "Wireshark's right-click `field == <displayed>` filter "
+            "matches without single-precision rounding mismatch.",
             HFILL }
         },
         { &hf_iccp_point_quality,
@@ -2255,8 +2623,28 @@ proto_register_iccp(void)
         { &hf_iccp_point_index,
           { "Index", "iccp.point.index",
             FT_UINT32, BASE_DEC, NULL, 0x0,
-            "Position of this point in the InformationReport "
-            "(0-based, in tree-walk order).",
+            "1-based ordinal among the recovered float points in this "
+            "InformationReport. Useful for filtering / I/O graphs but does "
+            "not match a TASE.2 Data Set Definition slot when the report "
+            "has non-point header items (timestamp, sequence counter).",
+            HFILL }
+        },
+        { &hf_iccp_point_slot,
+          { "Slot", "iccp.point.slot",
+            FT_UINT32, BASE_DEC, NULL, 0x0,
+            "0-based position of this point in listOfAccessResult. "
+            "Matches the ordinal in the partner's Data Set Definition / "
+            "bilateral table documentation, so is the right field to use "
+            "when correlating values to variable names.",
+            HFILL }
+        },
+        { &hf_iccp_point_name,
+          { "Name", "iccp.point.name",
+            FT_STRING, BASE_NONE, NULL, 0x0,
+            "Variable name for this slot, looked up in the user-supplied "
+            "DSD mapping (Edit -> Preferences -> Protocols -> ICCP -> "
+            "DSD Mapping) or in DSDs auto-captured from "
+            "DefineNamedVariableList PDUs earlier in the same conversation.",
             HFILL }
         },
     };
@@ -2311,6 +2699,33 @@ proto_register_iccp(void)
 
     expert_module_t *expert_iccp = expert_register_protocol(proto_iccp);
     expert_register_field_array(expert_iccp, ei, array_length(ei));
+
+    /* Preferences module (lets us register the DSD mapping UAT). */
+    module_t *iccp_module = prefs_register_protocol(proto_iccp, NULL);
+    uat_t *iccp_dsd_uat = uat_new(
+        "ICCP DSD Mapping",
+        sizeof(iccp_dsd_record_t),
+        "iccp_dsd",                   /* config-file name in the user's profile */
+        TRUE,                         /* user can edit */
+        &iccp_dsd_records,
+        &iccp_dsd_records_count,
+        UAT_AFFECTS_DISSECTION,
+        NULL,                         /* help URL */
+        iccp_dsd_copy_cb,
+        iccp_dsd_update_cb,
+        iccp_dsd_free_cb,
+        NULL,                         /* post_update_cb */
+        NULL,                         /* reset_cb */
+        iccp_dsd_fields);
+    prefs_register_uat_preference(iccp_module, "dsd_mapping",
+        "DSD (Data Set Definition) variable-name mapping",
+        "Maps (domain, transfer set, slot) tuples to the operator's "
+        "variable names so the recovered-points subtree can label each "
+        "point. Useful when the capture started mid-session and the "
+        "DefineNamedVariableList PDU that defined the data set was not "
+        "captured. One row per slot. Slot is 0-based and matches "
+        "iccp.point.slot.",
+        iccp_dsd_uat);
 
     iccp_handle = create_dissector_handle(dissect_iccp, proto_iccp);
     register_postdissector(iccp_handle);

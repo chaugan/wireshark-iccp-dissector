@@ -29,16 +29,33 @@ built against 4.2 will not load into 4.4. Drop into
 | Protocol column reads `ICCP`                              | yes                         | yes (since v0.4 the plugin wraps MMS at OID dispatch instead of post-dissecting, so `COL_PROTOCOL` is `ICCP` during the first pass) |
 | Info column reads `ICCP InformationReport [<category>: <name>]` | yes                  | yes (same OID wrapper path as Protocol column)                          |
 | `Statistics → ICCP/Statistics` populates                  | yes (`-z iccp,tree`)        | yes — an always-on tap listener fires on every dissection and re-emits saved tap data on retap, so the dialog populates immediately on first open |
-| Per-point recovery past the upstream MMS recursion bug    | yes                         | yes (since v0.5.1 — see *Non-obvious implementation notes*)            |
+| Per-point recovery past the upstream MMS recursion bug    | yes                         | yes — full listing under the iccp tree, with each Point #N as a structured subtree (Index / Slot / Value / Quality / Name); see *Non-obvious implementation notes*. The underlying upstream MMS bug is fixed in Wireshark 4.2.3+, so on 4.2.3 / 4.4 / 4.6 the listing is "Per-point listing" (parallel view); on 4.2.0–4.2.2 it's "Recovered points" (truncated MMS subtree workaround). The plugin detects per-frame which mode applies. |
+| Variable-name mapping (slot → operator name)              | yes (UAT preference)        | yes — Edit → Preferences → Protocols → ICCP → DSD Mapping. One row per `(domain, transferSet, slot, name)`; populated from the bilateral table doc. Names appear as `iccp.point.name` and inline in each Point #N row |
 | Expert-info on SBO violations                             | yes (synthetic capture)     | yes (synthetic capture)                                                |
 
 Both interfaces give the same functional analysis (tree, filters, stats,
-expert info, per-point quality + values). Earlier releases had a
-post-dissector ordering issue that left the GUI's Protocol/Info columns
-reading `MMS/IEC61850` and required a `Ctrl+R` retap for stats and
-filters; v0.4 fixed Protocol/Info via the OID wrapper, v0.5 fixed stats
-via the always-on tap listener, v0.5.1 fixed per-point data loss caused
-by Wireshark's MMS dissector aborting on multi-item reports.
+expert info, per-point quality + values, slot-to-name mapping). Version
+history of the friction points cleared away:
+
+- **v0.4** — wraps MMS at OID dispatch instead of post-dissecting, so the
+  GUI's Protocol / Info columns read `ICCP` / `ICCP <op>` during the
+  first-pass packet-list render (no more `Ctrl+R` for the columns).
+- **v0.5** — always-on `frame` tap listener with `TL_REQUIRES_PROTO_TREE`
+  + first-pass tap_info save/replay, so `Statistics → ICCP/Statistics`
+  populates immediately on first open.
+- **v0.5.1** — `TRY/CATCH(DissectorError)` around the MMS call + a
+  hand-rolled BER walker recover the per-point values past the upstream
+  `mms.c:2103` recursion-depth assertion that aborts MMS dissection
+  after ~2 items in any `SEQUENCE OF Data`.
+- **v0.6** — structured Point #N subtree under the iccp tree (each
+  point has Index / Slot / Value / Quality children); `iccp.point.slot`
+  matches the listOfAccessResult position used in bilateral table
+  documentation; `iccp.point.value` and `iccp.value.real` promoted to
+  `FT_DOUBLE` so right-click `field == <displayed>` filters match
+  without single-precision rounding mismatch; new DSD-mapping UAT
+  preference adds operator-supplied variable names per slot;
+  Recovered-points header text auto-adapts to "Per-point listing" on
+  Wireshark 4.2.3+ where the MMS subtree above is no longer truncated.
 
 ## What it does (functional behaviour, valid in both tshark and GUI)
 
@@ -89,11 +106,12 @@ on first open — no `Ctrl+R` dance.
 | **Association tracking**      | per-PDU only — MMS tracks request/response invokeIDs but has no notion of an ICCP association lifecycle | per-conversation `Candidate → Confirmed → Closed` state across the whole TCP flow, promoted only when a TASE.2 reserved name has actually been seen (so plain IEC 61850 traffic doesn't false-positive) |
 | **Block 5 Device Control**    | raw `Device_*Select / Operate` Read/Write PDUs, no semantics | cross-conversation SBO state machine (Idle → Selected → Operated). Validated on synthetic capture only |
 | **SBO security**              | nothing                          | Expert-info on SBO violation (Operate without Select), Direct Operate, stale Select. Synthetic only |
-| **Floating-point values**     | `mms.floating_point` is **`FT_BYTES`** in MMS — the proto tree shows the raw 5-byte hex (e.g. `0800000000`); MMS only decodes the float internally for IEC-61850 Info-column text and never exposes a decoded value as a sub-field for ICCP traffic | Inline IEEE-754 decode emitted as a generated `iccp.value.real` (FT_FLOAT) child under each `mms.floating_point` leaf (`Decoded float: 49.978`); filter- and graph-able |
+| **Floating-point values**     | `mms.floating_point` is **`FT_BYTES`** in MMS — the proto tree shows the raw 5-byte hex (e.g. `0800000000`); MMS only decodes the float internally for IEC-61850 Info-column text and never exposes a decoded value as a sub-field for ICCP traffic | Inline IEEE-754 decode emitted as a generated `iccp.value.real` (FT_DOUBLE since v0.6) child under each `mms.floating_point` leaf (`Decoded float: 49.97800064086914`); filter- and graph-able. Stored as double so right-click → *Apply as Filter* on a displayed value matches without single-precision rounding |
 | **Quality bytes**             | `mms.data_bit-string` is **`FT_BYTES`** — quality byte shown as raw hex with no flag-level decode | Decoded TASE.2 IndicationPoint quality: `iccp.quality.validity / .off_normal / .timestamp_invalid / .source` (each filter-able) plus a one-line `iccp.quality.summary` digest |
 | **IndicationPoints**          | generic `mms.structure_element` (FT_NONE) with separate float and bit-string children — no pairing | Synthesised `Point #N: <value> [VALIDITY / SOURCE / NORMAL / TS_OK]` single-line row per point under each structure |
 | **Transfer Set reports**      | `AccessResult: success / failure` per item — no per-report summary | `iccp.report.*`: per-PDU `point_count`, `success_count`, `failure_count`, structured-flag, and a `floats=N bit-strings=N …` summary line |
-| **Per-point recovery**        | bug-capped: Wireshark's MMS dissector hits a recursion-depth assertion at `mms.c:2103` once a `SEQUENCE OF Data` has more than ~2 items, and aborts. On real ICCP captures this fires on essentially every report (which carry tens to hundreds of points), so plain MMS shows at most the first 1-2 items in the proto tree and pastes `[Dissector bug, … mms.c:2103 …]` into Info | BER walker decodes the rest of `listOfAccessResult` / `listOfData` directly from the PDU bytes after MMS aborts; on the real anonymized capture this lifts max points/report from 1 to 384. `iccp_dispatch_via_oid` wraps the MMS call in `TRY/CATCH(DissectorError)` so the bug text no longer appears in `col_info` either |
+| **Per-point recovery**        | bug-capped on Wireshark **4.2.0 / 4.2.1 / 4.2.2**: the MMS dissector hits a recursion-depth assertion at `mms.c:dissect_mms_Data` once a `SEQUENCE OF Data` has more than ~2 items, and aborts. On real ICCP captures this fires on essentially every report (which carry tens to hundreds of points), so plain MMS shows at most the first 1-2 items in the proto tree and pastes `[Dissector bug, … mms.c …]` into Info. **Fixed upstream in Wireshark 4.2.3** (the bad `recursion_depth - cycle_size` underflow in `dissect_mms_Data` / `dissect_mms_TypeSpecification` / `dissect_mms_AlternateAccess` / `dissect_mms_VariableSpecification` was changed to restore the captured baseline) | BER walker decodes `listOfAccessResult` / `listOfData` directly from the PDU bytes regardless of whether MMS truncated. On real-world captures this lifts max points/report from 1 to 384. Each recovered point gets a structured Point #N subtree with Index / Slot / Value / Quality / (optional) Name children, all filterable. Header text auto-adapts: "Recovered points: N — MMS truncated this frame" on 4.2.0–4.2.2, "Per-point listing: N (parallel view of MMS listOfAccessResult)" on 4.2.3+. `iccp_dispatch_via_oid` wraps the MMS call in `TRY/CATCH(DissectorError)` so the bug text no longer appears in `col_info` either |
+| **Slot ↔ variable name**      | none — bilateral table position is implicit in the wire encoding (no per-point name on the wire); operators carry the slot-to-name mapping in their bilateral agreement out of band | `iccp.point.slot` exposes the 0-based listOfAccessResult position (matches what the bilateral table documents); a UAT preference (Edit → Preferences → Protocols → ICCP → DSD Mapping) maps `(domain, transferSet, slot)` rows to operator-supplied variable names that surface as `iccp.point.name` (filterable) and inline in each Point #N row text |
 | **Protocol column**           | `MMS` (or `MMS/IEC61850` when the IEC 61850 mapping preference is on, which is the default) | `ICCP` in both tshark and the GUI — the OID wrapper since v0.4 owns the ICCP abstract-syntax OIDs and writes the column during first-pass dissection |
 | **Info column**               | `col_clear` at start of `dissect_mms`; for ICCP-flavoured PDUs the MMS dissector then writes nothing (the `IEC 61850` Info-column branches all gate on IEC-61850-specific markers like `IEC61850_8_1_RPT`, `IEC61850_ITEM_ID_OPER`, the IEC-61850 confirmed-service PDU types). For an Initiate-Request MMS does write `Associate Request`; for InformationReports — the dominant ICCP traffic — Info is left empty and you typically see whatever PRES/SES wrote (`DATA TRANSFER (DT) SPDU`) | `<MMS PDU label> \| ICCP <op> [<category>: <name>]` in both tshark and the GUI; for Write-Request it also includes the inline-decoded float (e.g. `confirmed-RequestPDU -11.76 \| ICCP Write-Request`) |
 | **Statistics tree axes**      | none — the MMS dissector does not register a `stats_tree` | Operation, Object category, Conformance Block, Association state, Device sub-operation, Report outcomes, Points per Transfer Set, Point quality, Point value range, ICCP peers (src→dst), Operations by scope |
@@ -134,17 +152,19 @@ operators actually run in production.
 | `iccp.scope`                | string  | `VCC` (public) or `Bilateral` (peer-pair scope)     |
 | `iccp.domain`               | string  | Bilateral Table id when scope=Bilateral             |
 | `iccp.note`                 | string  | Free-form annotation attached to PDUs of interest   |
-| `iccp.point`                | string  | Synthesised `Point #N: <value> [quality]` row       |
-| `iccp.point.value`          | float   | Decoded numeric point value (graphable in I/O)      |
-| `iccp.point.quality`        | string  | Per-point quality summary                           |
-| `iccp.point.index`          | uint32  | Sequential index assigned within the PDU            |
+| `iccp.point`                | string  | Synthesised `Point #N: <value> [quality]` row (filterable as a single string match) |
+| `iccp.point.value`          | double  | Decoded numeric point value (FT_DOUBLE since v0.6 — right-click `== <displayed>` matches; graphable in I/O graphs via `AVG()` / `MAX()` / `MIN()`) |
+| `iccp.point.quality`        | string  | Per-point quality summary (`VALID` / `HELD` / `SUSPECT` / `NOT_VALID`) |
+| `iccp.point.index`          | uint32  | 1-based ordinal among the recovered float points in the report. Use `iccp.point.slot` to correlate with bilateral table docs — they're not the same when the report has non-point header items |
+| `iccp.point.slot`           | uint32  | 0-based position in `listOfAccessResult`. Matches the partner's Data Set Definition slot; this is what bilateral table documentation uses |
+| `iccp.point.name`           | string  | Operator-supplied variable name for this slot, when a row is present in the DSD-Mapping UAT preference (Edit → Preferences → Protocols → ICCP → DSD Mapping) |
 | `iccp.quality`              | uint8   | Raw TASE.2 quality byte (bitmask parent)            |
 | `iccp.quality.validity`     | uint8   | 0=VALID, 1=HELD, 2=SUSPECT, 3=NOT_VALID             |
 | `iccp.quality.off_normal`   | bool    | Off-normal flag (bit 5)                             |
 | `iccp.quality.timestamp_invalid` | bool | Timestamp invalid flag (bit 4)                     |
 | `iccp.quality.source`       | uint8   | 0=CURRENT, 1=HELD, 2=SUBSTITUTED, 3=GARBLED         |
 | `iccp.quality.summary`      | string  | One-line `VALIDITY / SOURCE / NORMAL / TS_OK` digest |
-| `iccp.value.real`           | float   | Inline-decoded MMS floating-point primitive         |
+| `iccp.value.real`           | double  | Inline-decoded MMS floating-point primitive (FT_DOUBLE since v0.6) |
 | `iccp.report.point_count`   | uint32  | Total AccessResult items in an InformationReport (recovered from PDU bytes, so accurate even past the upstream MMS recursion-depth bug) |
 | `iccp.report.success_count` | uint32  | Successful items                                    |
 | `iccp.report.failure_count` | uint32  | Failed items                                        |
@@ -432,10 +452,12 @@ operation, the Device-Control state machine, and the no-false-positive
 guard (plain-MMS Initiate doesn't promote to Confirmed ICCP).
 
 A separate Lua tap-listener smoke test `tests/verify_stats.lua` counts
-ICCP frames against a known-good fixture:
+ICCP frames via the iccp tap. Point it at any ICCP capture:
 
 ```bash
-tshark -2 -X lua_script:tests/verify_stats.lua -r pcaps/local/iccp2-annon.pcap -q
+python3 scripts/gen-iccp-pcap.py -o pcaps/generated/iccp-fictional.pcap
+tshark -2 -X lua_script:tests/verify_stats.lua \
+       -r pcaps/generated/iccp-fictional.pcap -q
 ```
 
 ## Sanitizing a real-world ICCP capture for sharing
@@ -579,6 +601,55 @@ tshark -r your.pcap -T fields -e frame.protocols | sort -u | grep mms
 User-set bindings win over the plugin's defaults — if you have an
 existing row for PCI 3, your value is kept.
 
+## Mapping point slots to variable names (DSD UAT)
+
+MMS InformationReports identify each value only by its **position in
+`listOfAccessResult`** — there's no per-point name on the wire. The
+mapping `slot → variable name` lives in the **Data Set Definition**
+that the bilateral peers negotiated at session setup. Concretely a
+real cyclic transfer set might look like:
+
+```
+Slot 0: TS_NAME_REFLECTION       (visible-string, header)
+Slot 1: SEQUENCE_COUNTER         (unsigned, header)
+Slot 2: FREQ_BUS_EXAMPLE_BUS    (struct: float + quality byte)
+Slot 3: GEN_MW_EXAMPLE_PLANT_G1       (struct: float + quality byte)
+…
+Slot 143: TIE_FLOW_NORDPOOL_HVDC (struct: float + quality byte)
+```
+
+If the capture covered the negotiation, the slot-to-name mapping is
+derivable from the corresponding `DefineNamedVariableList-Request` PDU
+on the wire (auto-capture into the plugin's lookup table is a roadmap
+item — currently you'd inspect that PDU manually). For
+mid-session captures (the common case), populate the mapping yourself
+in **Edit → Preferences → Protocols → ICCP → DSD (Data Set Definition)
+variable-name mapping**:
+
+| Domain | Transfer Set | Slot | Variable Name |
+|---|---|---|---|
+| `EXAMPLE_DOMAIN` | `EXAMPLE_DATASET` | 2 | `FREQ_BUS_EXAMPLE_BUS` |
+| `EXAMPLE_DOMAIN` | `EXAMPLE_DATASET` | 3 | `GEN_MW_EXAMPLE_PLANT_G1` |
+| `EXAMPLE_DOMAIN` | `EXAMPLE_DATASET` | 4 | `VOLT_LINE_EXAMPLE_LINE_KV` |
+| … | … | … | … |
+
+Once the mapping is loaded, every Point #N in the recovered subtree
+carries a `[Name: <variable name>]` child (filterable as
+`iccp.point.name`), and the parent row text becomes `Point #N: <value>
+[quality]  →  <variable name>` so you can scan without expanding.
+
+The mapping persists as `iccp_dsd` in your Wireshark profile; you can
+also create / edit the file directly with one row per line — note
+that **all four fields must be quoted, including the slot number**:
+
+```
+"EXAMPLE_DOMAIN","EXAMPLE_DATASET","2","FREQ_BUS_EXAMPLE_BUS"
+"EXAMPLE_DOMAIN","EXAMPLE_DATASET","3","GEN_MW_EXAMPLE_PLANT_G1"
+```
+
+(The GUI editor handles the quoting automatically — only the script /
+file-bulk-import case needs to know.)
+
 ---
 
 ## Non-obvious implementation notes
@@ -607,11 +678,23 @@ Documented in `packet-iccp.c` comment header but worth surfacing:
 5. ICCP uses TCP port 102. On non-standard ports, Wireshark won't
    dispatch TPKT / COTP / MMS automatically — pass
    `-d tcp.port==<port>,tpkt` to force it.
-6. **Wireshark's MMS dissector aborts on multi-item reports.** A
-   recursion-depth assertion at `epan/dissectors/packet-mms.c:2103`
-   fires whenever a `SEQUENCE OF Data` has more than ~2 items. On real
-   ICCP traffic this fires on essentially every InformationReport. The
-   plugin handles this in two places:
+6. **Wireshark's MMS dissector aborts on multi-item reports — fixed
+   upstream in 4.2.3.** Versions 4.2.0 / 4.2.1 / 4.2.2 have a
+   recursion-depth bookkeeping bug in
+   `epan/dissectors/packet-mms.c:dissect_mms_Data` (and
+   `dissect_mms_TypeSpecification` / `dissect_mms_AlternateAccess` /
+   `dissect_mms_VariableSpecification`). Each function captures the
+   pre-call `recursion_depth`, increments by `cycle_size` for the
+   recursion, and on return *subtracts* `cycle_size` from the captured
+   baseline — wrapping an unsigned counter on the very first call.
+   The next dissect_mms_Data sees a huge depth and `DISSECTOR_ASSERT
+   (recursion_depth <= MAX_RECURSION_DEPTH)` fires, aborting MMS
+   dissection. On real ICCP traffic this triggers on essentially every
+   InformationReport because every report is a `SEQUENCE OF` recursing
+   `dissect_mms_Data` per element. The fix in 4.2.3 (one-line change
+   per function) restores `recursion_depth` to the captured baseline
+   instead of subtracting. The plugin works around the bug on still-
+   buggy versions in two places:
    (a) `iccp_dispatch_via_oid` wraps `call_dissector_only(mms_handle,
    …)` in `TRY/CATCH(DissectorError)` so the assertion is absorbed
    before Wireshark's outer dispatcher can paste the bug text into
@@ -620,12 +703,37 @@ Documented in `packet-iccp.c` comment header but worth surfacing:
    `listOfAccessResult` / `listOfData` directly from the PDU bytes,
    walks structures and arrays recursively, and feeds the same
    counters and point arrays the proto-tree path uses, so floats and
-   quality bytes past item 2 still feed the stats and tap.
+   quality bytes past item 2 still feed the stats, the tap, and the
+   `Recovered points` subtree. The header text auto-adapts based on a
+   per-frame BER-vs-tree-count comparison: "Recovered points: N — MMS
+   truncated this frame" on buggy Wireshark, "Per-point listing: N
+   (parallel view)" on 4.2.3+.
 7. Plugin handoff calls `iccp_inject_pres_binding` to add the canonical
    ICCP context binding (PCI 3 → MMS abstract-syntax `1.0.9506.2.1`)
    into the in-memory `pres.users_table`. This makes mid-session
    captures (which miss the AARQ) dispatch to MMS without manual
    preference configuration. User-set entries for the same PCI win.
+8. **`iccp.point.value` and `iccp.value.real` are FT_DOUBLE since
+   v0.6**, not FT_FLOAT. Right-clicking on a displayed point value and
+   choosing *Apply as Filter* puts e.g. `iccp.point.value ==
+   4440.14013671875` into the bar; with single-precision storage this
+   would have rounded to `4440.14` for display, and the literal
+   `4440.14` doesn't compare equal to the stored `4440.140136…` value
+   when promoted to double. Storing as double means the displayed text
+   IS the stored value, so the round-trip works.
+9. **`iccp.point.slot` and `iccp.point.index` are different and both
+   useful.** `slot` is the 0-based position in `listOfAccessResult`
+   (the wire position used in bilateral table documentation); `index`
+   is the 1-based ordinal among recovered floats (skips header items
+   like sequence counters and timestamps). For correlating to operator
+   docs, use `slot`. For "the Nth float", use `index`.
+10. **Truncation detection compares `mms.AccessResult` /
+    `mms.structure` / `mms.floating_point` / `mms.data_bit-string` from
+    the proto tree against the BER walker's counts.** Note that the
+    actually-emitted abbrev for the structure-count is `mms.structure`
+    in 4.2.x and 4.6 alike — the duplicate `hf_mms_structure` field
+    registered with abbrev `mms.structure_element` is never actually
+    emitted. The plugin matches both names defensively.
 
 ## License
 
