@@ -17,6 +17,37 @@ built against 4.2 will not load into 4.4. Drop into
 `~/.local/lib/wireshark/plugins/<X.Y>/epan/iccp.so` (Linux) or
 `%APPDATA%\Wireshark\plugins\<X.Y>\epan\iccp.dll` (Windows).
 
+## Table of contents
+
+- [Where things work — tshark vs Wireshark GUI](#where-things-work--tshark-vs-wireshark-gui)
+- [What it does (functional behaviour, valid in both tshark and GUI)](#what-it-does-functional-behaviour-valid-in-both-tshark-and-gui)
+- [Features at a glance](#features-at-a-glance)
+  - [Conformance-Block coverage](#conformance-block-coverage)
+- [Display filter fields](#display-filter-fields)
+- [Supported Wireshark versions](#supported-wireshark-versions)
+  - [Targeting a different Wireshark release](#targeting-a-different-wireshark-release)
+- [Build (Linux)](#build-linux)
+- [Build (Windows, via WSL) — development loop used for this repo](#build-windows-via-wsl--development-loop-used-for-this-repo)
+- [Build (Windows, portable — no admin, no Visual Studio)](#build-windows-portable--no-admin-no-visual-studio)
+- [Build (Windows, native MSVC)](#build-windows-native-msvc)
+  - [Optional: full GUI build](#optional-full-gui-build)
+  - [Quick verification](#quick-verification)
+  - [Runtime coexistence with stock Wireshark](#runtime-coexistence-with-stock-wireshark)
+- [Generating a test PCAP](#generating-a-test-pcap)
+  - [`scripts/gen-pcap.sh` — coverage capture for the dissector regression suite](#scriptsgen-pcapsh--coverage-capture-for-the-dissector-regression-suite)
+  - [`scripts/gen-iccp-pcap.py` — fictional realistic ICCP capture](#scriptsgen-iccp-pcappy--fictional-realistic-iccp-capture)
+- [Running the regression suite](#running-the-regression-suite)
+- [Sanitizing a real-world ICCP capture for sharing](#sanitizing-a-real-world-iccp-capture-for-sharing)
+  - [What it rewrites](#what-it-rewrites)
+  - [What it does **not** change](#what-it-does-not-change)
+  - [Usage](#usage)
+- [Code-signing the Windows DLL (optional)](#code-signing-the-windows-dll-optional)
+- [Using the plugin on a real-world ICCP capture](#using-the-plugin-on-a-real-world-iccp-capture)
+  - [When auto-injection isn't enough](#when-auto-injection-isnt-enough)
+- [Mapping point slots to variable names (DSD UAT)](#mapping-point-slots-to-variable-names-dsd-uat)
+- [Non-obvious implementation notes](#non-obvious-implementation-notes)
+- [License](#license)
+
 ## Where things work — tshark vs Wireshark GUI
 
 | Capability                                                | tshark CLI                  | Wireshark GUI                                                          |
