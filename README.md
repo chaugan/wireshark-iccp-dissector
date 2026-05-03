@@ -19,6 +19,12 @@ built against 4.2 will not load into 4.4. Drop into
 
 ## Table of contents
 
+- [What it looks like in Wireshark](#what-it-looks-like-in-wireshark)
+  - [1. Data-set definition (`DefineNamedVariableList-Request`) on the wire](#1-data-set-definition-definenamedvariablelist-request-on-the-wire)
+  - [2. `InformationReport` with auto-populated point names](#2-informationreport-with-auto-populated-point-names)
+  - [3. `Statistics → ICCP/Statistics` — Points per Transfer Set](#3-statistics--iccpstatistics--points-per-transfer-set)
+  - [4. `Statistics → ICCP/Statistics` — operations and peers](#4-statistics--iccpstatistics--operations-and-peers)
+  - [5. I/O Graph filtered by variable name](#5-io-graph-filtered-by-variable-name)
 - [Where things work — tshark vs Wireshark GUI](#where-things-work--tshark-vs-wireshark-gui)
 - [What it does (functional behaviour, valid in both tshark and GUI)](#what-it-does-functional-behaviour-valid-in-both-tshark-and-gui)
 - [Features at a glance](#features-at-a-glance)
@@ -47,6 +53,89 @@ built against 4.2 will not load into 4.4. Drop into
 - [Mapping point slots to variable names (DSD UAT)](#mapping-point-slots-to-variable-names-dsd-uat)
 - [Non-obvious implementation notes](#non-obvious-implementation-notes)
 - [License](#license)
+
+## What it looks like in Wireshark
+
+All screenshots below are from `pcaps/generated/iccp-fictional.pcap`,
+the synthetic capture produced by [`scripts/gen-iccp-pcap.py`](#scriptsgen-iccp-pcappy--fictional-realistic-iccp-capture).
+No UAT entries, no profile tweaks — just the plugin loaded and
+the file opened.
+
+### 1. Data-set definition (`DefineNamedVariableList-Request`) on the wire
+
+![DefineNVL request frames](docs/screenshots/01-define-nvl-frames.png)
+
+The packet list shows the `DefineNamedVariableList-Request` /
+`-Response` pairs that establish each Transfer Set. The Info
+column lists the (domain, listName, [variable items]) being
+declared, so the negotiation is readable at a glance. The
+detail pane on the bottom shows the MMS dissection of
+`listOfVariable` (each item's `variableSpecification.name`)
+and the iccp tree classifying it as
+`[Operation: DefineNamedVariableList-Request]`. These frames
+are what the dissector's auto-discovery scans to populate
+`iccp.point.name` on subsequent reports.
+
+### 2. `InformationReport` with auto-populated point names
+
+![InformationReport with point names](docs/screenshots/02-information-report-with-names.png)
+
+A `B2 InformationReport` for `AURORA_FROST / DS_ANA_M_Z_OST`. The
+iccp tree shows `Operation`, `Object name`, `Object category`,
+`Conformance Block`, `Bilateral domain`, the report counts, and
+the per-validity / per-type summary. Below that, the
+**Recovered points** subtree gives one row per point with
+`Index`, `Slot`, `Name`, `Value` and `Quality`. Names like
+`FROST_S_SPONTAN_BUS_NORD_001` come from the on-wire DSD
+captured earlier in the same conversation — the inline
+`→ FROST_S_SPONTAN_BUS_NORD_001` on the parent line means you
+can also see the name without expanding.
+
+### 3. `Statistics → ICCP/Statistics` — Points per Transfer Set
+
+![ICCP stats: per-Transfer-Set bucketing](docs/screenshots/03-stats-points-per-transfer-set.png)
+
+Top half of the stats dialog. **Points per Transfer Set** breaks
+the 11 007 points down by Transfer Set name (`DS_ANA_S_Z_SUD`,
+`DS_ANA_S_Z_NRT`, `DS_ANA_M_Z_SUD`, …) — one bucket per data set
+declared on the wire. **Point values by validity** splits the
+same data along the quality byte (VALID / SUSPECT / NOT_VALID /
+HELD). **Point values by Transfer Set** carries the same
+buckets but shows numerical statistics (Average / Min / Max).
+**Quality mix per PDU (%)** averages the per-PDU quality
+distribution. None of these axes need any operator setup; the
+names come from the auto-discovered DSDs.
+
+### 4. `Statistics → ICCP/Statistics` — operations and peers
+
+![ICCP stats: ops, peers, association state](docs/screenshots/04-stats-pdu-sizes-and-peers.png)
+
+Bottom half of the same dialog. **PDU sizes (bytes)** and
+**Operation** counts every PDU type seen — including the new
+`DefineNamedVariableList-Request` / `-Response` frames produced
+by the generator (30 each in this run). **ICCP peers** shows
+the directional traffic mix across all bilateral peers. The
+**Association state** axis confirms that 2404 of 2414 PDUs
+landed inside a Confirmed ICCP association (the 10 Candidate
+PDUs are the Initiate exchange itself, before Confirm).
+**Conformance Block** classifies every report under Block 2
+(Block-2 cyclic data), which is what the synthetic generator
+produces.
+
+### 5. I/O Graph filtered by variable name
+
+![I/O Graph: iccp.point.value over time, filtered by name](docs/screenshots/05-io-graph-by-point-name.png)
+
+`Statistics → I/O Graphs` plotting
+`MAX(iccp.point.value)` filtered by
+`(iccp) && (iccp.point.name == "FROST_S_SPONTAN_BUS_NORD_003")`.
+Because the per-point items live in the proto tree as
+`FT_DOUBLE` and the auto-discovered names attach as
+`iccp.point.name`, the analyst can graph any specific ICCP
+data point over the whole capture by its operator-facing
+name — without writing the slot number or knowing where in
+`listOfAccessResult` it sits. The same filter works in
+`tshark -Y` and in custom Lua taps.
 
 ## Where things work — tshark vs Wireshark GUI
 
@@ -507,87 +596,11 @@ distribution, multi-bilateral peer mesh) — none of which the
 `gen-pcap.sh` coverage capture gives. Names are entirely fictional and
 the pcap cannot be linked back to any real-world utility.
 
-#### What it looks like in Wireshark
-
-All screenshots below are from the synthetic capture above
-(`pcaps/generated/iccp-fictional.pcap`). No UAT entries, no
-profile tweaks — just the plugin loaded and the file opened.
-
-##### 1. Data-set definition (`DefineNamedVariableList-Request`) on the wire
-
-![DefineNVL request frames](docs/screenshots/01-define-nvl-frames.png)
-
-The packet list shows the `DefineNamedVariableList-Request` /
-`-Response` pairs that establish each Transfer Set. The Info
-column lists the (domain, listName, [variable items]) being
-declared, so the negotiation is readable at a glance. The
-detail pane on the bottom shows the MMS dissection of
-`listOfVariable` (each item's `variableSpecification.name`)
-and the iccp tree classifying it as
-`[Operation: DefineNamedVariableList-Request]`. These frames
-are what the dissector's auto-discovery scans to populate
-`iccp.point.name` on subsequent reports.
-
-##### 2. `InformationReport` with auto-populated point names
-
-![InformationReport with point names](docs/screenshots/02-information-report-with-names.png)
-
-A `B2 InformationReport` for `AURORA_FROST / DS_ANA_M_Z_OST`. The
-iccp tree shows `Operation`, `Object name`, `Object category`,
-`Conformance Block`, `Bilateral domain`, the report counts, and
-the per-validity / per-type summary. Below that, the
-**Recovered points** subtree gives one row per point with
-`Index`, `Slot`, `Name`, `Value` and `Quality`. Names like
-`FROST_S_SPONTAN_BUS_NORD_001` come from the on-wire DSD
-captured earlier in the same conversation — the inline
-`→ FROST_S_SPONTAN_BUS_NORD_001` on the parent line means you
-can also see the name without expanding.
-
-##### 3. `Statistics → ICCP/Statistics` — Points per Transfer Set
-
-![ICCP stats: per-Transfer-Set bucketing](docs/screenshots/03-stats-points-per-transfer-set.png)
-
-Top half of the stats dialog. **Points per Transfer Set** breaks
-the 11 007 points down by Transfer Set name (`DS_ANA_S_Z_SUD`,
-`DS_ANA_S_Z_NRT`, `DS_ANA_M_Z_SUD`, …) — one bucket per data set
-declared on the wire. **Point values by validity** splits the
-same data along the quality byte (VALID / SUSPECT / NOT_VALID /
-HELD). **Point values by Transfer Set** carries the same
-buckets but shows numerical statistics (Average / Min / Max).
-**Quality mix per PDU (%)** averages the per-PDU quality
-distribution. None of these axes need any operator setup; the
-names come from the auto-discovered DSDs.
-
-##### 4. `Statistics → ICCP/Statistics` — operations and peers
-
-![ICCP stats: ops, peers, association state](docs/screenshots/04-stats-pdu-sizes-and-peers.png)
-
-Bottom half of the same dialog. **PDU sizes (bytes)** and
-**Operation** counts every PDU type seen — including the new
-`DefineNamedVariableList-Request` / `-Response` frames produced
-by the generator (30 each in this run). **ICCP peers** shows
-the directional traffic mix across all bilateral peers. The
-**Association state** axis confirms that 2404 of 2414 PDUs
-landed inside a Confirmed ICCP association (the 10 Candidate
-PDUs are the Initiate exchange itself, before Confirm).
-**Conformance Block** classifies every report under Block 2
-(Block-2 cyclic data), which is what the synthetic generator
-produces.
-
-##### 5. I/O Graph filtered by variable name
-
-![I/O Graph: iccp.point.value over time, filtered by name](docs/screenshots/05-io-graph-by-point-name.png)
-
-`Statistics → I/O Graphs` plotting
-`MAX(iccp.point.value)` filtered by
-`(iccp) && (iccp.point.name == "FROST_S_SPONTAN_BUS_NORD_003")`.
-Because the per-point items live in the proto tree as
-`FT_DOUBLE` and the auto-discovered names attach as
-`iccp.point.name`, the analyst can graph any specific ICCP
-data point over the whole capture by its operator-facing
-name — without writing the slot number or knowing where in
-`listOfAccessResult` it sits. The same filter works in
-`tshark -Y` and in custom Lua taps.
+For a visual walkthrough of what the dissector does on this
+capture (DSD frames on the wire, auto-populated point names in
+the iccp tree, per-Transfer-Set stats, an I/O graph filtered by
+variable name), see [What it looks like in Wireshark](#what-it-looks-like-in-wireshark)
+near the top of this README.
 
 ## Running the regression suite
 
