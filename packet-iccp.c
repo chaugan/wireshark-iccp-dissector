@@ -152,12 +152,15 @@ static int hf_iccp_quality_summary   = -1;
  * quality. We synthesise an "iccp.point" item that puts both on a
  * single line so a 250-point report becomes 250 readable rows
  * instead of 1000 raw-hex sub-leaves. */
-static int hf_iccp_point_summary     = -1;
-static int hf_iccp_point_value       = -1;
-static int hf_iccp_point_quality     = -1;
-static int hf_iccp_point_index       = -1;
-static int hf_iccp_point_slot        = -1;
-static int hf_iccp_point_name        = -1;
+static int hf_iccp_point_summary               = -1;
+static int hf_iccp_point_value                 = -1;
+static int hf_iccp_point_quality               = -1;
+static int hf_iccp_point_index                 = -1;
+static int hf_iccp_point_slot                  = -1;
+static int hf_iccp_point_name                  = -1;
+static int hf_iccp_point_timestamp             = -1;
+static int hf_iccp_point_timestamp_ms_extended = -1;
+static int hf_iccp_point_timestamp_age         = -1;
 
 /* Forward declaration: the user-supplied DSD-mapping UAT lives further
  * down in the file (next to its registration in proto_register_iccp);
@@ -876,6 +879,28 @@ classify_operation(const iccp_pdu_flags_t *f)
     return ICCP_OP_NONE;
 }
 
+/* Per-point timestamp captured from a TASE.2 RealQTimeTag /
+ * RealQTimeTagExtended IndicationPoint shape. ts is the absolute UTC
+ * time decoded from BinaryTime6 (length 6) or BinaryTime8 (length 8).
+ * ms_extended carries the raw 16-bit fractional-ms field present on
+ * length-8 form (per IEC 60870-6 Annex C, "fractional ms in units of
+ * 1/2^16 ms"). length 4 BinaryTimes only carry ms-of-day with no
+ * date; we store them as ts.secs in 0..86399 with a TRUE has_time_only
+ * flag so consumers know not to treat secs as a unix timestamp. */
+typedef struct {
+    nstime_t ts;
+    guint16  ms_extended;
+    gboolean has_ms_extended;   /* TRUE iff BinaryTime8 (8 bytes) */
+    gboolean has_time_only;     /* TRUE iff BinaryTime4 (no date) */
+} iccp_point_time_t;
+
+/* Forward decls -- these helpers live further down (near the BER
+ * byte-walker) but maybe_synthesise_point above uses them. */
+static gboolean iccp_decode_binary_time(tvbuff_t *tvb, int offset, int length,
+                                        iccp_point_time_t *out);
+static void     iccp_format_point_time(char *buf, size_t buflen,
+                                        const iccp_point_time_t *pt);
+
 /* Per-walk context so we can number points and emit aggregate stats. */
 typedef struct {
     guint32  point_index;        /* incremented as we synthesise iccp.point rows */
@@ -904,6 +929,17 @@ typedef struct {
      * the BER walker provided the points; may be 0 when only the tree
      * walk fed point_values. */
     wmem_array_t *point_slots;        /* guint32 per element */
+    /* Optional per-point timestamp capture for TASE.2 RealQTimeTag /
+     * RealQTimeTagExtended IndicationPoints. Both walkers append one
+     * iccp_point_time_t per binary-time leaf they encounter inside a
+     * point structure. NULL means "skip timestamp capture". */
+    wmem_array_t *point_timestamps;   /* iccp_point_time_t per element */
+    /* Frame's wire timestamp (pinfo->abs_ts) -- used to derive the
+     * iccp.point.timestamp.age relative-time field. Populated by
+     * dissect_iccp / iccp_force_tree_packet alongside the per-point
+     * arrays. Zero on contexts that don't have a frame (regression
+     * fixtures), in which case age computation is skipped. */
+    nstime_t frame_abs_ts;
     /* When TRUE, the walker collects counters and per-point arrays but
      * does NOT mutate the proto tree (no [Decoded float], no [Quality
      * decoded], no Point #N synthesis rows). Used by the always-on
@@ -961,7 +997,8 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
      * float and one bit-string, treat it as an IndicationPoint. */
     proto_node *fp_node = NULL;
     proto_node *bs_node = NULL;
-    int floats = 0, bitstrings = 0;
+    proto_node *bt_node = NULL;        /* first binary-time leaf (the timestamp) */
+    int floats = 0, bitstrings = 0, binary_times = 0;
     /* Bounded depth-first walk over node's descendants. */
     typedef struct stk_s { proto_node *p; struct stk_s *next; } stk_t;
     stk_t *stack = NULL;
@@ -979,6 +1016,9 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
                 fp_node = cur; floats++;
             } else if (strcmp(a, "mms.data_bit-string") == 0) {
                 bs_node = cur; bitstrings++;
+            } else if (strcmp(a, "mms.data.binary-time") == 0) {
+                if (binary_times == 0) bt_node = cur;
+                binary_times++;
             }
         }
         for (proto_node *cc = cur->first_child; cc; cc = cc->next) {
@@ -986,7 +1026,12 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
             s->p = cc; s->next = stack; stack = s;
         }
     }
-    if (floats != 1 || bitstrings != 1 || !fp_node || !bs_node) return;
+    /* Accept TASE.2 RealQ (no time), RealQTimeTag (BinaryTime6), and
+     * RealQTimeTagExtended (BinaryTime8). Reject anything with multiple
+     * floats / bit-strings or with more than one binary-time, since
+     * those are ambiguous shapes we don't model. */
+    if (floats != 1 || bitstrings != 1 || binary_times > 1) return;
+    if (!fp_node || !bs_node) return;
 
     field_info *fp_fi = PNODE_FINFO(fp_node);
     field_info *bs_fi = PNODE_FINFO(bs_node);
@@ -997,12 +1042,33 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
     gfloat  v = tvb_get_ntohieee_float(fp_fi->ds_tvb, fp_fi->start + 1);
     guint8  q = tvb_get_guint8(bs_fi->ds_tvb, bs_fi->start);
 
+    /* Decode the optional BinaryTime if present. The MMS dissector
+     * emits the binary-time field bytes via fi->ds_tvb / fi->start /
+     * fi->length; the field may be 4 / 6 / 8 bytes per the TASE.2
+     * shapes. iccp_decode_binary_time vets length and content. */
+    iccp_point_time_t pt = { 0 };
+    gboolean          have_pt = FALSE;
+    char              tsbuf[40] = {0};
+    if (bt_node) {
+        field_info *bt_fi = PNODE_FINFO(bt_node);
+        if (bt_fi && bt_fi->ds_tvb) {
+            have_pt = iccp_decode_binary_time(bt_fi->ds_tvb, bt_fi->start,
+                                              bt_fi->length, &pt);
+            if (have_pt) iccp_format_point_time(tsbuf, sizeof tsbuf, &pt);
+        }
+    }
+
     char qbuf[64];
     iccp_quality_summary(qbuf, sizeof qbuf, q);
 
-    char line[160];
-    g_snprintf(line, sizeof line, "Point #%u: %.6g  [%s]",
-               ctx->point_index, v, qbuf);
+    char line[224];
+    if (have_pt) {
+        g_snprintf(line, sizeof line, "Point #%u: %.6g  [%s] @ %s",
+                   ctx->point_index, v, qbuf, tsbuf);
+    } else {
+        g_snprintf(line, sizeof line, "Point #%u: %.6g  [%s]",
+                   ctx->point_index, v, qbuf);
+    }
     ctx->point_index++;
 
     /* Promote the structure_element to a subtree (it usually already
@@ -1037,6 +1103,54 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
                                              fp_fi->ds_tvb, fp_fi->start, 0,
                                              ctx->point_index - 1);
         proto_item_set_generated(ii);
+
+        /* Per-point timestamp items (only if the point structure
+         * carried a BinaryTime). bt_fi covers the on-wire BinaryTime
+         * field span so right-click -> Match Selected highlights the
+         * source bytes correctly. */
+        if (have_pt && bt_node) {
+            field_info *bt_fi = PNODE_FINFO(bt_node);
+            if (bt_fi && bt_fi->ds_tvb) {
+                proto_item *ti = proto_tree_add_time(psub, hf_iccp_point_timestamp,
+                                                     bt_fi->ds_tvb, bt_fi->start,
+                                                     bt_fi->length, &pt.ts);
+                proto_item_set_generated(ti);
+                if (pt.has_ms_extended) {
+                    proto_item *xi = proto_tree_add_uint(psub,
+                                                         hf_iccp_point_timestamp_ms_extended,
+                                                         bt_fi->ds_tvb,
+                                                         bt_fi->start + 6, 2,
+                                                         pt.ms_extended);
+                    proto_item_set_generated(xi);
+                }
+                /* Age: how stale is this measurement relative to when
+                 * we received the frame on the wire. Negative means
+                 * the point's timestamp is in the FUTURE relative to
+                 * the frame -- usually a clock-sync issue at the
+                 * remote substation. Skipped on time-of-day-only
+                 * points (BinaryTime4) since their secs aren't a
+                 * unix wall-clock. */
+                if (!pt.has_time_only) {
+                    nstime_t age;
+                    nstime_delta(&age, &ctx->frame_abs_ts, &pt.ts);
+                    proto_item *ai = proto_tree_add_time(psub,
+                                                         hf_iccp_point_timestamp_age,
+                                                         bt_fi->ds_tvb,
+                                                         bt_fi->start,
+                                                         bt_fi->length, &age);
+                    proto_item_set_generated(ai);
+                }
+            }
+        }
+    }
+
+    /* Capture timestamp into the per-point array regardless of read_only
+     * mode -- the array feeds tap consumers / stats axes, not the proto
+     * tree. has_pt=FALSE means RealQ shape (no BinaryTime); we still
+     * append a zero-initialised entry so the array stays index-aligned
+     * with point_values / point_validities. */
+    if (ctx->point_timestamps) {
+        wmem_array_append_one(ctx->point_timestamps, pt);
     }
 
     /* Roll the synthesised point into the per-PDU aggregates so the
@@ -1212,6 +1326,101 @@ iccp_quality_validity_class(guint8 q)
     return (guint8)((q & 0xC0) >> 6);
 }
 
+/* MMS BinaryTime epoch: 1984-01-01 00:00:00 UTC.
+ * Constant used by iccp_decode_binary_time. */
+#define ICCP_BINARY_TIME_EPOCH ((time_t)441763200)
+
+/* Decode an MMS BinaryTime / TASE.2 IndicationPoint timestamp.
+ *
+ *   length 4: ms-of-day uint32 BE only (no date) -- "TimeOfDay" form
+ *   length 6: ms-of-day uint32 BE + days-since-1984 uint16 BE
+ *             ("BinaryTime6" / RealQTimeTag)
+ *   length 8: BinaryTime6 + 2-byte fractional-ms extension uint16 BE
+ *             ("BinaryTime8" / RealQTimeTagExtended)
+ *
+ * Returns FALSE if the length isn't one of those three or the bytes
+ * are out-of-range. On success out->ts holds the decoded UTC time
+ * (or, for length 4, secs in 0..86399 with has_time_only=TRUE). The
+ * 16-bit fractional ms is in out->ms_extended for length 8; we do NOT
+ * fold it into ts.nsecs because vendor interpretations of the fraction
+ * vary (1/65536 ms vs straight microseconds vs proprietary). Callers
+ * that need sub-millisecond precision can compute it from ms_extended. */
+static gboolean
+iccp_decode_binary_time(tvbuff_t *tvb, int offset, int length,
+                        iccp_point_time_t *out)
+{
+    if (!out || !tvb) return FALSE;
+    if (length != 4 && length != 6 && length != 8) return FALSE;
+
+    nstime_set_zero(&out->ts);
+    out->ms_extended     = 0;
+    out->has_ms_extended = FALSE;
+    out->has_time_only   = FALSE;
+
+    guint32 ms_of_day = tvb_get_ntohl(tvb, offset);
+    if (ms_of_day > 86400000U) return FALSE;
+
+    out->ts.secs  = (time_t)(ms_of_day / 1000);
+    out->ts.nsecs = (int)((ms_of_day % 1000) * 1000000);
+
+    if (length == 4) {
+        out->has_time_only = TRUE;
+        return TRUE;
+    }
+
+    guint16 days = tvb_get_ntohs(tvb, offset + 4);
+    out->ts.secs += ICCP_BINARY_TIME_EPOCH + (time_t)days * (time_t)86400;
+
+    if (length == 8) {
+        out->ms_extended     = tvb_get_ntohs(tvb, offset + 6);
+        out->has_ms_extended = TRUE;
+    }
+    return TRUE;
+}
+
+/* Format a decoded IndicationPoint timestamp into a short
+ * "YYYY-MM-DD HH:MM:SS.mmm" (or ".mmm+ext" when extended) string.
+ * Buffer should be at least 40 bytes. For has_time_only entries
+ * (BinaryTime4) the date prefix is replaced with "(time-of-day) ". */
+static void
+iccp_format_point_time(char *buf, size_t buflen, const iccp_point_time_t *pt)
+{
+    if (!buf || buflen == 0 || !pt) {
+        if (buf && buflen) buf[0] = '\0';
+        return;
+    }
+    if (pt->has_time_only) {
+        guint32 ms = (guint32)(pt->ts.secs * 1000) + (guint32)(pt->ts.nsecs / 1000000);
+        guint32 h  = (ms / 3600000U) % 24;
+        guint32 m  = (ms / 60000U) % 60;
+        guint32 s  = (ms / 1000U) % 60;
+        guint32 mr = ms % 1000U;
+        g_snprintf(buf, buflen, "(time-of-day) %02u:%02u:%02u.%03u", h, m, s, mr);
+        return;
+    }
+    /* gmtime is portable enough for the 1984..2099 range BinaryTime6 covers. */
+    time_t t = pt->ts.secs;
+    struct tm tm;
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    int ms = pt->ts.nsecs / 1000000;
+    if (pt->has_ms_extended) {
+        g_snprintf(buf, buflen,
+                   "%04d-%02d-%02d %02d:%02d:%02d.%03d+%u",
+                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                   tm.tm_hour, tm.tm_min, tm.tm_sec, ms,
+                   (unsigned)pt->ms_extended);
+    } else {
+        g_snprintf(buf, buflen,
+                   "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+                   tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                   tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
+    }
+}
+
 static void
 iccp_ber_walk_one_data(tvbuff_t *tvb, const guint8 *base, guint8 tag,
                        const guint8 *content, guint32 len,
@@ -1303,8 +1512,48 @@ iccp_ber_walk_one_data(tvbuff_t *tvb, const guint8 *base, guint8 tag,
         case 0x8a: /* visible-string [10] */
             flags->visible_string_count++;
             break;
-        case 0x8c: /* binary-time [12] */
+        case 0x8c: /* binary-time [12] -- TASE.2 RealQTimeTag (BinaryTime6 = 6 bytes)
+                    * or RealQTimeTagExtended (BinaryTime8 = 8 bytes), or rare
+                    * BinaryTime4 (4 bytes, time-of-day only). */
             flags->binary_time_count++;
+            if (walk_ctx && walk_ctx->point_timestamps && tvb && base) {
+                int offset = (int)(content - base);
+                iccp_point_time_t pt;
+                if (iccp_decode_binary_time(tvb, offset, (int)len, &pt)) {
+                    wmem_array_append_one(walk_ctx->point_timestamps, pt);
+                    /* Hidden filter-target items so iccp.point.timestamp /
+                     * .ms_extended / .age match in display filter scans
+                     * even when MMS is in fake-out tree mode. */
+                    if (walk_ctx->hidden_tree) {
+                        proto_item *ti = proto_tree_add_time(walk_ctx->hidden_tree,
+                                                             hf_iccp_point_timestamp,
+                                                             tvb, offset, (int)len,
+                                                             &pt.ts);
+                        proto_item_set_hidden(ti);
+                        proto_item_set_generated(ti);
+                        if (pt.has_ms_extended) {
+                            proto_item *xi = proto_tree_add_uint(walk_ctx->hidden_tree,
+                                                                 hf_iccp_point_timestamp_ms_extended,
+                                                                 tvb, offset + 6, 2,
+                                                                 pt.ms_extended);
+                            proto_item_set_hidden(xi);
+                            proto_item_set_generated(xi);
+                        }
+                        if (!pt.has_time_only
+                            && (walk_ctx->frame_abs_ts.secs != 0
+                             || walk_ctx->frame_abs_ts.nsecs != 0)) {
+                            nstime_t age;
+                            nstime_delta(&age, &walk_ctx->frame_abs_ts, &pt.ts);
+                            proto_item *ai = proto_tree_add_time(walk_ctx->hidden_tree,
+                                                                 hf_iccp_point_timestamp_age,
+                                                                 tvb, offset, (int)len,
+                                                                 &age);
+                            proto_item_set_hidden(ai);
+                            proto_item_set_generated(ai);
+                        }
+                    }
+                }
+            }
             break;
         case 0xa1: /* array     [1] IMPLICIT SEQUENCE OF Data */
         case 0xa2: /* structure [2] IMPLICIT SEQUENCE OF Data */
@@ -1550,6 +1799,11 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
     out->walk_ctx.point_values     = wmem_array_new(array_scope, sizeof(gfloat));
     out->walk_ctx.point_validities = wmem_array_new(array_scope, sizeof(guint8));
     out->walk_ctx.point_slots      = wmem_array_new(array_scope, sizeof(guint32));
+    out->walk_ctx.point_timestamps = wmem_array_new(array_scope, sizeof(iccp_point_time_t));
+    /* Wire timestamp of the current frame; used by maybe_synthesise_point
+     * to compute iccp.point.timestamp.age = frame_abs_ts - point.timestamp.
+     * pinfo->abs_ts is set by Wireshark from the pcap packet header. */
+    out->walk_ctx.frame_abs_ts     = pinfo ? pinfo->abs_ts : (nstime_t){0,0};
     if (out->flags.floating_point_count > 0
         || out->flags.bit_string_count   > 0
         || out->flags.structure_count    > 0) {
@@ -2953,6 +3207,37 @@ proto_register_iccp(void)
             "DSD mapping (Edit -> Preferences -> Protocols -> ICCP -> "
             "DSD Mapping) or in DSDs auto-captured from "
             "DefineNamedVariableList PDUs earlier in the same conversation.",
+            HFILL }
+        },
+        { &hf_iccp_point_timestamp,
+          { "Timestamp", "iccp.point.timestamp",
+            FT_ABSOLUTE_TIME, ABSOLUTE_TIME_UTC, NULL, 0x0,
+            "TASE.2 IndicationPoint sample time, decoded from the BinaryTime "
+            "field in the point structure (RealQTimeTag = 6-byte BinaryTime6, "
+            "RealQTimeTagExtended = 8-byte BinaryTime8 = BinaryTime6 + 2-byte "
+            "fractional-millisecond extension). Epoch is 1984-01-01 00:00:00 "
+            "UTC per ISO/IEC 9506. Empty on RealQ-shape points (no time field).",
+            HFILL }
+        },
+        { &hf_iccp_point_timestamp_ms_extended,
+          { "Timestamp ms-extended", "iccp.point.timestamp.ms_extended",
+            FT_UINT16, BASE_DEC, NULL, 0x0,
+            "Raw 16-bit fractional-millisecond field present only on "
+            "TASE.2 RealQTimeTagExtended (BinaryTime8) points. Per IEC "
+            "60870-6-503 Annex C, units are 1/2^16 of a millisecond, "
+            "though some vendors use straight microseconds (0..999) -- "
+            "interpret per your peer.",
+            HFILL }
+        },
+        { &hf_iccp_point_timestamp_age,
+          { "Timestamp age", "iccp.point.timestamp.age",
+            FT_RELATIVE_TIME, BASE_NONE, NULL, 0x0,
+            "frame.time - iccp.point.timestamp -- how stale this measurement "
+            "is relative to when the frame arrived on the wire. Negative "
+            "values mean the substation's clock is in the future relative "
+            "to the capture host (typical clock-sync issue). Filter on "
+            "iccp.point.timestamp.age > 5.0 to find stale data, "
+            "iccp.point.timestamp.age < -1.0 for clock skew.",
             HFILL }
         },
     };
