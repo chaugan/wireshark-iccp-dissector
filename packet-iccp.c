@@ -129,17 +129,19 @@ static int hf_iccp_report_summary    = -1;
  * decode them here. */
 static int hf_iccp_value_real        = -1;
 
-/* TASE.2 IndicationPoint quality (per IEC 60870-6-503). Encoded as a
- * 1-byte BIT STRING in MMS:
- *   bits 7-6  validity         00=VALID  01=HELD  10=SUSPECT  11=NOT_VALID
- *   bit  5    normal           0=NORMAL  1=OFF_NORMAL
- *   bit  4    timestamp_qual   0=VALID   1=INVALID
- *   bits 3-2  current_source   00=CURRENT 01=HELD 10=SUBSTITUTED 11=GARBLED
+/* TASE.2 IndicationPoint quality (per IEC 60870-6-802 §8.2.1, the
+ * Object Models companion to IEC 60870-6-503). Encoded as a 1-byte
+ * BIT STRING in MMS:
+ *   bits 7-6  validity         00=VALID 01=HELD 10=SUSPECT 11=NOT_VALID
+ *   bit  5    normal           0=NORMAL 1=OFF_NORMAL
+ *   bit  4    timestamp_qual   0=VALID  1=INVALID
+ *   bits 3-2  current_source   00=TELEMETERED  01=CALCULATED
+ *                              10=ENTERED      11=ESTIMATED
  *   bits 1-0  reserved
  * Each subfield is exposed as its own filterable hf so users can
  * graph or filter individual flags; iccp.quality is the raw byte for
  * the bitmask child rendering, iccp.quality.summary is a one-line
- * human-friendly digest like "VALID/CURRENT/NORMAL/TS_OK". */
+ * human-friendly digest like "VALID/TELEMETERED/NORMAL/TS_OK". */
 static int hf_iccp_quality           = -1;
 static int hf_iccp_quality_validity  = -1;
 static int hf_iccp_quality_normal    = -1;
@@ -203,6 +205,7 @@ static int st_node_devices    = -1;
 static int st_node_reports    = -1;
 static int st_node_points_set    = -1;  /* Tier 3: pivot per Transfer-Set (count) */
 static int st_node_points_qual   = -1;  /* Tier 3: validity-class breakdown (count) */
+static int st_node_points_source = -1;  /* Tier 3: CurrentSource breakdown (count) */
 static int st_node_points_range  = -1;  /* Tier 3: value range buckets (count) */
 static int st_node_peers         = -1;  /* Tier 5: per src->dst peer pivot (count) */
 static int st_node_scope         = -1;  /* TASE.2 name scope (VCC vs Bilateral) (count) */
@@ -257,6 +260,11 @@ typedef struct {
     guint32        points_held;
     guint32        points_suspect;
     guint32        points_notvalid;
+    /* CurrentSource histogram per IEC 60870-6-802 §8.2.1. */
+    guint32        points_telemetered;
+    guint32        points_calculated;
+    guint32        points_entered;
+    guint32        points_estimated;
     gfloat         point_value_min;
     gfloat         point_value_max;
     gfloat         point_value_sum;
@@ -299,11 +307,23 @@ static const value_string iccp_q_validity_vals[] = {
     { 0, NULL }
 };
 
+/* CurrentSource per IEC 60870-6-802 (TASE.2 Object Models) section 8.2.1.
+ * The 2-bit field encodes how the value was acquired by the source
+ * RTU / control center -- operationally critical because it tells you
+ * whether you're looking at a real telemetered measurement or a
+ * filled-in estimate.
+ *
+ * Earlier code used DNP3-style labels (CURRENT/HELD/SUBSTITUTED/GARBLED)
+ * that don't match TASE.2 spec; corrected to the canonical names.
+ * The bit values themselves are unchanged, so any saved display filter
+ * referencing iccp.quality.source by integer (e.g. == 0) still works;
+ * filters that referenced the OLD string names ("CURRENT" etc.) need
+ * to be updated to the new ones. */
 static const value_string iccp_q_source_vals[] = {
-    { 0, "CURRENT" },
-    { 1, "HELD" },
-    { 2, "SUBSTITUTED" },
-    { 3, "GARBLED" },
+    { 0, "TELEMETERED" },  /* came from a real telemetry channel */
+    { 1, "CALCULATED"  },  /* derived/computed from other measurements */
+    { 2, "ENTERED"     },  /* manually keyed in by an operator */
+    { 3, "ESTIMATED"   },  /* system filled in (real value unavailable) */
     { 0, NULL }
 };
 
@@ -921,6 +941,14 @@ typedef struct {
     guint32  points_held;
     guint32  points_suspect;
     guint32  points_notvalid;
+    /* Per-PDU CurrentSource histogram (TASE.2 IEC 60870-6-802 §8.2.1).
+     * Bits 3-2 of the quality byte. Maps point provenance:
+     * TELEMETERED = real telemetry, CALCULATED = derived,
+     * ENTERED = manually keyed, ESTIMATED = system fill-in. */
+    guint32  points_telemetered;
+    guint32  points_calculated;
+    guint32  points_entered;
+    guint32  points_estimated;
     gfloat   v_min;
     gfloat   v_max;
     gfloat   v_sum;
@@ -1172,6 +1200,14 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
         case 1: ctx->points_held++;     break;
         case 2: ctx->points_suspect++;  break;
         case 3: ctx->points_notvalid++; break;
+    }
+    /* CurrentSource histogram (bits 3-2 of quality byte). */
+    guint8 src = (guint8)((q & ICCP_Q_SOURCE_MASK) >> 2);
+    switch (src) {
+        case 0: ctx->points_telemetered++; break;
+        case 1: ctx->points_calculated++;  break;
+        case 2: ctx->points_entered++;     break;
+        case 3: ctx->points_estimated++;   break;
     }
     if (!ctx->has_value || v < ctx->v_min) ctx->v_min = v;
     if (!ctx->has_value || v > ctx->v_max) ctx->v_max = v;
@@ -1452,6 +1488,15 @@ iccp_ber_walk_one_data(tvbuff_t *tvb, const guint8 *base, guint8 tag,
                 guint8 vc = iccp_quality_validity_class(q);
                 if (walk_ctx->point_validities) {
                     wmem_array_append_one(walk_ctx->point_validities, vc);
+                }
+                /* CurrentSource histogram (bits 3-2 of quality byte) --
+                 * bumped on every recovered point so the per-PDU and
+                 * per-Transfer-Set stats axes show provenance. */
+                switch ((q & 0x0C) >> 2) {
+                    case 0: walk_ctx->points_telemetered++; break;
+                    case 1: walk_ctx->points_calculated++;  break;
+                    case 2: walk_ctx->points_entered++;     break;
+                    case 3: walk_ctx->points_estimated++;   break;
                 }
                 /* Hidden filter-target items so iccp.quality.* and
                  * iccp.quality match in the GUI's filter scan even when
@@ -2121,6 +2166,10 @@ iccp_emit_tap(packet_info *pinfo,
     ti2->points_held       = walk_ctx->points_held;
     ti2->points_suspect    = walk_ctx->points_suspect;
     ti2->points_notvalid   = walk_ctx->points_notvalid;
+    ti2->points_telemetered = walk_ctx->points_telemetered;
+    ti2->points_calculated  = walk_ctx->points_calculated;
+    ti2->points_entered     = walk_ctx->points_entered;
+    ti2->points_estimated   = walk_ctx->points_estimated;
     ti2->point_value_min   = walk_ctx->v_min;
     ti2->point_value_max   = walk_ctx->v_max;
     ti2->point_value_sum   = walk_ctx->v_sum;
@@ -2623,6 +2672,10 @@ iccp_stats_tree_init(stats_tree *st)
      * tallies how many TASE.2 IndicationPoints were carried. */
     st_node_points_set   = stats_tree_create_node(st, "Points per Transfer Set", 0, STAT_DT_INT, TRUE);
     st_node_points_qual  = stats_tree_create_node(st, "Point quality",           0, STAT_DT_INT, TRUE);
+    /* Per-IEC 60870-6-802 §8.2.1 CurrentSource: how points were
+     * acquired. Highly operational -- a high ESTIMATED count flags
+     * unreliable RTUs / failing telemetry channels. */
+    st_node_points_source = stats_tree_create_node(st, "Point CurrentSource",     0, STAT_DT_INT, TRUE);
     st_node_points_range = stats_tree_create_node(st, "Point value range",       0, STAT_DT_INT, TRUE);
     /* Tier 5: per-peer activity. Pivot keyed on "src -> dst". Acts as
      * a lightweight ICCP conversation table without the weight of
@@ -2733,6 +2786,21 @@ iccp_stats_tree_packet(stats_tree *st,
                 increase_stat_node(st, "SUSPECT",   st_node_points_qual, FALSE, ti->points_suspect);
             if (ti->points_notvalid)
                 increase_stat_node(st, "NOT_VALID", st_node_points_qual, FALSE, ti->points_notvalid);
+        }
+
+        /* CurrentSource histogram. */
+        guint32 src_total = ti->points_telemetered + ti->points_calculated
+                          + ti->points_entered    + ti->points_estimated;
+        if (src_total > 0) {
+            increase_stat_node(st, "Point CurrentSource", 0, TRUE, src_total);
+            if (ti->points_telemetered)
+                increase_stat_node(st, "TELEMETERED", st_node_points_source, FALSE, ti->points_telemetered);
+            if (ti->points_calculated)
+                increase_stat_node(st, "CALCULATED",  st_node_points_source, FALSE, ti->points_calculated);
+            if (ti->points_entered)
+                increase_stat_node(st, "ENTERED",     st_node_points_source, FALSE, ti->points_entered);
+            if (ti->points_estimated)
+                increase_stat_node(st, "ESTIMATED",   st_node_points_source, FALSE, ti->points_estimated);
         }
 
         if (ti->has_point_values) {
@@ -3231,9 +3299,16 @@ proto_register_iccp(void)
             HFILL }
         },
         { &hf_iccp_quality_source,
-          { "Source", "iccp.quality.source",
+          { "CurrentSource", "iccp.quality.source",
             FT_UINT8, BASE_DEC, VALS(iccp_q_source_vals), ICCP_Q_SOURCE_MASK,
-            NULL, HFILL }
+            "TASE.2 CurrentSource (IEC 60870-6-802 §8.2.1): how the value "
+            "was acquired. TELEMETERED = real measurement off the wire; "
+            "CALCULATED = derived from other points; ENTERED = manually "
+            "keyed by an operator; ESTIMATED = system filled in because "
+            "the real value was unavailable. A high ESTIMATED rate "
+            "across a Transfer Set indicates an unreliable source RTU "
+            "or a degraded link.",
+            HFILL }
         },
         { &hf_iccp_quality_summary,
           { "Quality summary", "iccp.quality.summary",
