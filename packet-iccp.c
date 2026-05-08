@@ -133,7 +133,7 @@ static int hf_iccp_value_real        = -1;
  * Object Models companion to IEC 60870-6-503). Encoded as a 1-byte
  * BIT STRING in MMS:
  *   bits 7-6  validity         00=VALID 01=HELD 10=SUSPECT 11=NOT_VALID
- *   bit  5    normal           0=NORMAL 1=OFF_NORMAL
+ *   bit  5    NormalValue      1=NORMAL 0=OFF_NORMAL  (per spec, NOT inverted)
  *   bit  4    timestamp_qual   0=VALID  1=INVALID
  *   bits 3-2  current_source   00=TELEMETERED  01=CALCULATED
  *                              10=ENTERED      11=ESTIMATED
@@ -163,6 +163,9 @@ static int hf_iccp_point_name                  = -1;
 static int hf_iccp_point_timestamp             = -1;
 static int hf_iccp_point_timestamp_ms_extended = -1;
 static int hf_iccp_point_timestamp_age         = -1;
+static int hf_iccp_point_state                 = -1;
+static int hf_iccp_point_state_supplemental    = -1;
+static int hf_iccp_point_discrete              = -1;
 
 /* Forward declaration: the user-supplied DSD-mapping UAT lives further
  * down in the file (next to its registration in proto_register_iccp);
@@ -337,7 +340,12 @@ iccp_quality_summary(char *buf, size_t buflen, guint8 q)
                                           iccp_q_validity_vals, "?");
     const char *source = val_to_str_const((q & ICCP_Q_SOURCE_MASK)   >> 2,
                                           iccp_q_source_vals,   "?");
-    const char *normal = (q & ICCP_Q_NORMAL_MASK)     ? "OFF_NORMAL" : "NORMAL";
+    /* NormalValue per IEC 60870-6-802 §8.2.1: bit set => point IS in
+     * its normal operating range. Earlier code had the sense inverted
+     * (showing OFF_NORMAL for healthy points and NORMAL for alarming
+     * ones), which is the opposite of every TASE.2 reference and
+     * conflicts with what SCADA HMIs actually do with this bit. */
+    const char *normal = (q & ICCP_Q_NORMAL_MASK)     ? "NORMAL" : "OFF_NORMAL";
     const char *tsq    = (q & ICCP_Q_TS_INVALID_MASK) ? "TS_INVALID" : "TS_OK";
     g_snprintf(buf, buflen, "%s / %s / %s / %s", valid, source, normal, tsq);
     return buf;
@@ -1034,10 +1042,11 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
      * mms.data_element (FT_NONE element wrapper) depending on the
      * dissector version. As long as the structure has exactly one
      * float and one bit-string, treat it as an IndicationPoint. */
-    proto_node *fp_node = NULL;
-    proto_node *bs_node = NULL;
-    proto_node *bt_node = NULL;        /* first binary-time leaf (the timestamp) */
-    int floats = 0, bitstrings = 0, binary_times = 0;
+    proto_node *fp_node     = NULL;
+    proto_node *bs_nodes[3] = { NULL, NULL, NULL };  /* up to 3 for StateSupplemental */
+    proto_node *int_node    = NULL;
+    proto_node *bt_node     = NULL;
+    int floats = 0, bitstrings = 0, integers = 0, binary_times = 0;
     /* Bounded depth-first walk over node's descendants. */
     typedef struct stk_s { proto_node *p; struct stk_s *next; } stk_t;
     stk_t *stack = NULL;
@@ -1050,12 +1059,18 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
         stack = stack->next;
         field_info *cfi = PNODE_FINFO(cur);
         if (cfi && cfi->hfinfo && cfi->hfinfo->abbrev) {
-            const char *a = cfi->hfinfo->abbrev;
-            if (strcmp(a, "mms.floating_point") == 0) {
-                fp_node = cur; floats++;
-            } else if (strcmp(a, "mms.data_bit-string") == 0) {
-                bs_node = cur; bitstrings++;
-            } else if (strcmp(a, "mms.data.binary-time") == 0) {
+            const char *abbr = cfi->hfinfo->abbrev;
+            if (strcmp(abbr, "mms.floating_point") == 0) {
+                if (!fp_node) fp_node = cur;
+                floats++;
+            } else if (strcmp(abbr, "mms.data_bit-string") == 0) {
+                if (bitstrings < 3) bs_nodes[bitstrings] = cur;
+                bitstrings++;
+            } else if (strcmp(abbr, "mms.integer") == 0
+                    || strcmp(abbr, "mms.unsigned") == 0) {
+                if (!int_node) int_node = cur;
+                integers++;
+            } else if (strcmp(abbr, "mms.data.binary-time") == 0) {
                 if (binary_times == 0) bt_node = cur;
                 binary_times++;
             }
@@ -1065,26 +1080,103 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
             s->p = cc; s->next = stack; stack = s;
         }
     }
-    /* Accept TASE.2 RealQ (no time), RealQTimeTag (BinaryTime6), and
-     * RealQTimeTagExtended (BinaryTime8). Reject anything with multiple
-     * floats / bit-strings or with more than one binary-time, since
-     * those are ambiguous shapes we don't model. */
-    if (floats != 1 || bitstrings != 1 || binary_times > 1) return;
-    if (!fp_node || !bs_node) return;
+    /* Determine the IndicationPoint shape per IEC 60870-6-802:
+     *   Real / RealQ / RealQTimeTag : 1 float + 1 bit-string [+ 1 binary-time]
+     *   Discrete / DiscreteQ        : 1 integer + 1 bit-string
+     *   State / StateQ              : 0 floats + 0 integers + 2 bit-strings
+     *                                 (first = DoubleState, second = quality)
+     *   StateSupplemental(Q)        : 0 floats + 0 integers + 3 bit-strings
+     *                                 (first = state, second = supp flags,
+     *                                  third = quality) */
+    enum {
+        PSHAPE_NONE,
+        PSHAPE_REAL,        /* float + quality, optional binary-time */
+        PSHAPE_DISCRETE,    /* integer + quality */
+        PSHAPE_STATE,       /* state-2bit + quality */
+        PSHAPE_STATE_SUP,   /* state-2bit + supp flags + quality */
+    } pshape = PSHAPE_NONE;
 
-    field_info *fp_fi = PNODE_FINFO(fp_node);
-    field_info *bs_fi = PNODE_FINFO(bs_node);
-    if (!fp_fi || fp_fi->length < 5 || !fp_fi->ds_tvb) return;
-    if (!bs_fi || bs_fi->length < 1 || !bs_fi->ds_tvb) return;
-    if (tvb_get_guint8(fp_fi->ds_tvb, fp_fi->start) != 8) return;
+    /* All four shapes may also carry an optional BinaryTime
+     * (RealQTimeTag / StateQTimeTag / DiscreteQTimeTag etc.). */
+    if (binary_times > 1) return;
+    if (floats == 1 && integers == 0 && bitstrings == 1) {
+        pshape = PSHAPE_REAL;
+    } else if (floats == 0 && integers == 1 && bitstrings == 1) {
+        pshape = PSHAPE_DISCRETE;
+    } else if (floats == 0 && integers == 0 && bitstrings == 2) {
+        pshape = PSHAPE_STATE;
+    } else if (floats == 0 && integers == 0 && bitstrings == 3) {
+        pshape = PSHAPE_STATE_SUP;
+    } else {
+        return;  /* unknown / ambiguous shape -- don't synthesise */
+    }
 
-    gfloat  v = tvb_get_ntohieee_float(fp_fi->ds_tvb, fp_fi->start + 1);
-    guint8  q = tvb_get_guint8(bs_fi->ds_tvb, bs_fi->start);
+    /* Quality is the LAST bit-string in the structure regardless of
+     * shape. For Real/Discrete that's bs_nodes[0]; for State that's
+     * bs_nodes[1]; for StateSupplemental that's bs_nodes[2]. */
+    proto_node *quality_node = NULL;
+    proto_node *value_node   = NULL;
+    proto_node *supp_node    = NULL;
+    switch (pshape) {
+        case PSHAPE_REAL:
+            value_node = fp_node; quality_node = bs_nodes[0]; break;
+        case PSHAPE_DISCRETE:
+            value_node = int_node; quality_node = bs_nodes[0]; break;
+        case PSHAPE_STATE:
+            value_node = bs_nodes[0]; quality_node = bs_nodes[1]; break;
+        case PSHAPE_STATE_SUP:
+            value_node = bs_nodes[0]; supp_node = bs_nodes[1];
+            quality_node = bs_nodes[2]; break;
+        default: return;
+    }
 
-    /* Decode the optional BinaryTime if present. The MMS dissector
-     * emits the binary-time field bytes via fi->ds_tvb / fi->start /
-     * fi->length; the field may be 4 / 6 / 8 bytes per the TASE.2
-     * shapes. iccp_decode_binary_time vets length and content. */
+    field_info *qfi = PNODE_FINFO(quality_node);
+    if (!qfi || qfi->length < 2 || !qfi->ds_tvb) return;
+    /* Quality bit-string content layout: byte 0 = unused-bits count,
+     * byte 1 = the 8 quality flag bits. We always read byte 1. */
+    guint8 q = tvb_get_guint8(qfi->ds_tvb, qfi->start + 1);
+
+    /* Decode the value -- type-specific. */
+    char vbuf[80] = {0};                /* one-line display string */
+    gfloat  v_real     = 0.0f;          /* real point value */
+    gint32  v_discrete = 0;             /* discrete point integer */
+    guint8  v_state    = 0;             /* DoubleState 0..3 */
+    guint8  v_supp     = 0;             /* StateSupplemental flags byte */
+    static const char *state_names[4] = {
+        "INTERMEDIATE", "OFF", "ON", "INVALID"
+    };
+
+    if (pshape == PSHAPE_REAL) {
+        field_info *fp_fi = PNODE_FINFO(value_node);
+        if (!fp_fi || fp_fi->length < 5 || !fp_fi->ds_tvb) return;
+        if (tvb_get_guint8(fp_fi->ds_tvb, fp_fi->start) != 8) return;
+        v_real = tvb_get_ntohieee_float(fp_fi->ds_tvb, fp_fi->start + 1);
+        g_snprintf(vbuf, sizeof vbuf, "%.6g", (double)v_real);
+    } else if (pshape == PSHAPE_DISCRETE) {
+        field_info *ifi = PNODE_FINFO(value_node);
+        if (!ifi || !ifi->value) return;
+        v_discrete = fvalue_get_sinteger(ifi->value);
+        g_snprintf(vbuf, sizeof vbuf, "%d", v_discrete);
+    } else { /* STATE or STATE_SUP */
+        field_info *sfi = PNODE_FINFO(value_node);
+        if (!sfi || sfi->length < 2 || !sfi->ds_tvb) return;
+        /* DoubleState: 2 bits in byte 1, high bits = state value. */
+        guint8 sbits = tvb_get_guint8(sfi->ds_tvb, sfi->start + 1);
+        v_state = (sbits >> 6) & 0x03;
+        if (pshape == PSHAPE_STATE_SUP && supp_node) {
+            field_info *spfi = PNODE_FINFO(supp_node);
+            if (spfi && spfi->length >= 2 && spfi->ds_tvb) {
+                v_supp = tvb_get_guint8(spfi->ds_tvb, spfi->start + 1);
+            }
+            g_snprintf(vbuf, sizeof vbuf, "%s+sup=0x%02x",
+                       state_names[v_state], v_supp);
+        } else {
+            g_snprintf(vbuf, sizeof vbuf, "%s", state_names[v_state]);
+        }
+    }
+
+    /* Optional BinaryTime decode -- can attach to any of the four
+     * shapes (RealQTimeTag, StateQTimeTag, DiscreteQTimeTag, etc.). */
     iccp_point_time_t pt = { 0 };
     gboolean          have_pt = FALSE;
     char              tsbuf[40] = {0};
@@ -1100,100 +1192,116 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
     char qbuf[64];
     iccp_quality_summary(qbuf, sizeof qbuf, q);
 
-    char line[224];
+    /* Type tag in the synthesised line so analysts can see at a glance
+     * which IndicationPoint shape this row decoded as. */
+    const char *type_tag =
+        pshape == PSHAPE_REAL      ? ""              :
+        pshape == PSHAPE_DISCRETE  ? " (int)"        :
+        pshape == PSHAPE_STATE     ? " (state)"      :
+        pshape == PSHAPE_STATE_SUP ? " (state-sup)"  :
+                                     "";
+    char line[256];
     if (have_pt) {
-        g_snprintf(line, sizeof line, "Point #%u: %.6g  [%s] @ %s",
-                   ctx->point_index, v, qbuf, tsbuf);
+        g_snprintf(line, sizeof line, "Point #%u%s: %s  [%s] @ %s",
+                   ctx->point_index, type_tag, vbuf, qbuf, tsbuf);
     } else {
-        g_snprintf(line, sizeof line, "Point #%u: %.6g  [%s]",
-                   ctx->point_index, v, qbuf);
+        g_snprintf(line, sizeof line, "Point #%u%s: %s  [%s]",
+                   ctx->point_index, type_tag, vbuf, qbuf);
     }
     ctx->point_index++;
 
-    /* Promote the structure_element to a subtree (it usually already
-     * is one, but proto_item_add_subtree is idempotent for our
-     * ett_iccp_point on a fresh node) and add the synthesis row.
-     * Skipped in read_only mode -- the listener path runs the same
-     * walker AFTER the dissector pass already added these rows, and
-     * adding them a second time would duplicate Point #N entries
-     * in the GUI detail pane. */
+    /* Emit synthesised proto items (skipped in read_only mode). */
     if (!ctx->read_only) {
-        proto_tree *sub = proto_item_add_subtree(node, ett_iccp_point);
-        proto_item *pit = proto_tree_add_string(sub, hf_iccp_point_summary,
-                                                fp_fi->ds_tvb,
-                                                fp_fi->start,
-                                                (bs_fi->start + bs_fi->length)
-                                                  - fp_fi->start,
-                                                line);
-        proto_item_set_generated(pit);
-        proto_tree *psub = proto_item_add_subtree(pit, ett_iccp_point);
-        /* Promote to double so Wireshark's `iccp.point.value == <displayed>`
-         * filter matches: single-precision would round-trip through display
-         * formatting and lose the literal that the right-click suggests. */
-        proto_item *vi = proto_tree_add_double(psub, hf_iccp_point_value,
-                                               fp_fi->ds_tvb, fp_fi->start,
-                                               fp_fi->length, (gdouble)v);
-        proto_item_set_generated(vi);
-        proto_item *qi = proto_tree_add_string(psub, hf_iccp_point_quality,
-                                               bs_fi->ds_tvb, bs_fi->start,
-                                               bs_fi->length, qbuf);
-        proto_item_set_generated(qi);
-        proto_item *ii = proto_tree_add_uint(psub, hf_iccp_point_index,
-                                             fp_fi->ds_tvb, fp_fi->start, 0,
-                                             ctx->point_index - 1);
-        proto_item_set_generated(ii);
+        field_info *val_fi = PNODE_FINFO(value_node);
+        if (val_fi && val_fi->ds_tvb) {
+            proto_tree *sub = proto_item_add_subtree(node, ett_iccp_point);
+            proto_item *pit = proto_tree_add_string(sub, hf_iccp_point_summary,
+                                                    val_fi->ds_tvb,
+                                                    val_fi->start,
+                                                    (qfi->start + qfi->length)
+                                                      - val_fi->start,
+                                                    line);
+            proto_item_set_generated(pit);
+            proto_tree *psub = proto_item_add_subtree(pit, ett_iccp_point);
 
-        /* Per-point timestamp items (only if the point structure
-         * carried a BinaryTime). bt_fi covers the on-wire BinaryTime
-         * field span so right-click -> Match Selected highlights the
-         * source bytes correctly. */
-        if (have_pt && bt_node) {
-            field_info *bt_fi = PNODE_FINFO(bt_node);
-            if (bt_fi && bt_fi->ds_tvb) {
-                proto_item *ti = proto_tree_add_time(psub, hf_iccp_point_timestamp,
-                                                     bt_fi->ds_tvb, bt_fi->start,
-                                                     bt_fi->length, &pt.ts);
-                proto_item_set_generated(ti);
-                if (pt.has_ms_extended) {
-                    proto_item *xi = proto_tree_add_uint(psub,
-                                                         hf_iccp_point_timestamp_ms_extended,
-                                                         bt_fi->ds_tvb,
-                                                         bt_fi->start + 6, 2,
-                                                         pt.ms_extended);
-                    proto_item_set_generated(xi);
+            /* Type-specific value field. */
+            if (pshape == PSHAPE_REAL) {
+                proto_item *vi = proto_tree_add_double(psub, hf_iccp_point_value,
+                                                       val_fi->ds_tvb, val_fi->start,
+                                                       val_fi->length, (gdouble)v_real);
+                proto_item_set_generated(vi);
+            } else if (pshape == PSHAPE_DISCRETE) {
+                proto_item *vi = proto_tree_add_int(psub, hf_iccp_point_discrete,
+                                                    val_fi->ds_tvb, val_fi->start,
+                                                    val_fi->length, v_discrete);
+                proto_item_set_generated(vi);
+            } else { /* STATE / STATE_SUP */
+                proto_item *vi = proto_tree_add_string(psub, hf_iccp_point_state,
+                                                       val_fi->ds_tvb, val_fi->start,
+                                                       val_fi->length,
+                                                       state_names[v_state]);
+                proto_item_set_generated(vi);
+                if (pshape == PSHAPE_STATE_SUP && supp_node) {
+                    field_info *spfi = PNODE_FINFO(supp_node);
+                    if (spfi && spfi->ds_tvb) {
+                        proto_item *xi = proto_tree_add_uint(psub,
+                                                             hf_iccp_point_state_supplemental,
+                                                             spfi->ds_tvb, spfi->start,
+                                                             spfi->length, v_supp);
+                        proto_item_set_generated(xi);
+                    }
                 }
-                /* Age: how stale is this measurement relative to when
-                 * we received the frame on the wire. Negative means
-                 * the point's timestamp is in the FUTURE relative to
-                 * the frame -- usually a clock-sync issue at the
-                 * remote substation. Skipped on time-of-day-only
-                 * points (BinaryTime4) since their secs aren't a
-                 * unix wall-clock. */
-                if (!pt.has_time_only) {
-                    nstime_t age;
-                    nstime_delta(&age, &ctx->frame_abs_ts, &pt.ts);
-                    proto_item *ai = proto_tree_add_time(psub,
-                                                         hf_iccp_point_timestamp_age,
-                                                         bt_fi->ds_tvb,
-                                                         bt_fi->start,
-                                                         bt_fi->length, &age);
-                    proto_item_set_generated(ai);
+            }
+
+            proto_item *qi = proto_tree_add_string(psub, hf_iccp_point_quality,
+                                                   qfi->ds_tvb, qfi->start,
+                                                   qfi->length, qbuf);
+            proto_item_set_generated(qi);
+            proto_item *ii = proto_tree_add_uint(psub, hf_iccp_point_index,
+                                                 val_fi->ds_tvb, val_fi->start, 0,
+                                                 ctx->point_index - 1);
+            proto_item_set_generated(ii);
+
+            /* BinaryTime children (Real only). */
+            if (have_pt && bt_node) {
+                field_info *bt_fi = PNODE_FINFO(bt_node);
+                if (bt_fi && bt_fi->ds_tvb) {
+                    proto_item *ti = proto_tree_add_time(psub, hf_iccp_point_timestamp,
+                                                         bt_fi->ds_tvb, bt_fi->start,
+                                                         bt_fi->length, &pt.ts);
+                    proto_item_set_generated(ti);
+                    if (pt.has_ms_extended) {
+                        proto_item *xi = proto_tree_add_uint(psub,
+                                                             hf_iccp_point_timestamp_ms_extended,
+                                                             bt_fi->ds_tvb,
+                                                             bt_fi->start + 6, 2,
+                                                             pt.ms_extended);
+                        proto_item_set_generated(xi);
+                    }
+                    if (!pt.has_time_only) {
+                        nstime_t age;
+                        nstime_delta(&age, &ctx->frame_abs_ts, &pt.ts);
+                        proto_item *ai = proto_tree_add_time(psub,
+                                                             hf_iccp_point_timestamp_age,
+                                                             bt_fi->ds_tvb,
+                                                             bt_fi->start,
+                                                             bt_fi->length, &age);
+                        proto_item_set_generated(ai);
+                    }
                 }
             }
         }
     }
 
-    /* Capture timestamp into the per-point array regardless of read_only
-     * mode -- the array feeds tap consumers / stats axes, not the proto
-     * tree. has_pt=FALSE means RealQ shape (no BinaryTime); we still
-     * append a zero-initialised entry so the array stays index-aligned
-     * with point_values / point_validities. */
+    /* Capture timestamp into the per-point array (zero entry for
+     * shapes / packets without a BinaryTime, so indices stay aligned
+     * with point_values / point_validities). */
     if (ctx->point_timestamps) {
         wmem_array_append_one(ctx->point_timestamps, pt);
     }
 
-    /* Roll the synthesised point into the per-PDU aggregates so the
-     * post-dissector can forward them to the tap (Tier 3 stats). */
+    /* Per-PDU validity / source histograms -- always derived from the
+     * quality byte regardless of point shape. */
     guint8 vc = (guint8)((q & ICCP_Q_VALIDITY_MASK) >> 6);
     switch (vc) {
         case 0: ctx->points_valid++;    break;
@@ -1201,7 +1309,6 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
         case 2: ctx->points_suspect++;  break;
         case 3: ctx->points_notvalid++; break;
     }
-    /* CurrentSource histogram (bits 3-2 of quality byte). */
     guint8 src = (guint8)((q & ICCP_Q_SOURCE_MASK) >> 2);
     switch (src) {
         case 0: ctx->points_telemetered++; break;
@@ -1209,17 +1316,18 @@ maybe_synthesise_point(proto_node *node, iccp_walk_ctx_t *ctx)
         case 2: ctx->points_entered++;     break;
         case 3: ctx->points_estimated++;   break;
     }
-    if (!ctx->has_value || v < ctx->v_min) ctx->v_min = v;
-    if (!ctx->has_value || v > ctx->v_max) ctx->v_max = v;
-    ctx->v_sum    += v;
-    ctx->has_value = TRUE;
 
-    /* Per-point detail for STAT_DT_FLOAT stats axes. Allocated upstream
-     * from pinfo->pool; the listener iterates these in lock-step so a
-     * mismatch between the two arrays would silently drop validity
-     * information (kept consistent here by appending both unconditionally). */
-    if (ctx->point_values) {
-        wmem_array_append_one(ctx->point_values, v);
+    /* Per-point Real value tracking -- min/max/sum/array only make
+     * sense for Real shape. State/Discrete contribute to the validity
+     * and source histograms but not to the value distribution axes. */
+    if (pshape == PSHAPE_REAL) {
+        if (!ctx->has_value || v_real < ctx->v_min) ctx->v_min = v_real;
+        if (!ctx->has_value || v_real > ctx->v_max) ctx->v_max = v_real;
+        ctx->v_sum    += v_real;
+        ctx->has_value = TRUE;
+        if (ctx->point_values) {
+            wmem_array_append_one(ctx->point_values, v_real);
+        }
     }
     if (ctx->point_validities) {
         wmem_array_append_one(ctx->point_validities, vc);
@@ -3286,10 +3394,13 @@ proto_register_iccp(void)
             NULL, HFILL }
         },
         { &hf_iccp_quality_normal,
-          { "Off-normal", "iccp.quality.off_normal",
+          { "NormalValue", "iccp.quality.normal_value",
             FT_BOOLEAN, 8, NULL, ICCP_Q_NORMAL_MASK,
-            "0 = NORMAL, 1 = OFF_NORMAL. The point reading falls "
-            "outside its declared normal range.",
+            "Per IEC 60870-6-802 §8.2.1: 1 = NORMAL (point reading is "
+            "within its declared normal operating range), 0 = OFF_NORMAL "
+            "(reading is outside the normal range -- the SCADA HMI "
+            "alarm-triggers on this). Earlier code had this inverted; "
+            "the corrected sense matches the TASE.2 spec.",
             HFILL }
         },
         { &hf_iccp_quality_ts_invalid,
@@ -3392,6 +3503,34 @@ proto_register_iccp(void)
             "to the capture host (typical clock-sync issue). Filter on "
             "iccp.point.timestamp.age > 5.0 to find stale data, "
             "iccp.point.timestamp.age < -1.0 for clock skew.",
+            HFILL }
+        },
+        { &hf_iccp_point_state,
+          { "State", "iccp.point.state",
+            FT_STRING, BASE_NONE, NULL, 0x0,
+            "TASE.2 DoubleState (per IEC 60870-6-802 §8.2.2): the 2-bit "
+            "state value, decoded as INTERMEDIATE / OFF / ON / INVALID. "
+            "OFF / ON typically map to switch / breaker positions; "
+            "INTERMEDIATE means in transition (both contacts open or "
+            "closed during operation); INVALID means contradictory "
+            "feedback (sensor stuck or both contacts asserted). "
+            "Populated only on State / StateSupplemental shaped points.",
+            HFILL }
+        },
+        { &hf_iccp_point_state_supplemental,
+          { "State supplemental", "iccp.point.state_supplemental",
+            FT_UINT8, BASE_HEX, NULL, 0x0,
+            "Raw 8-bit supplemental flag byte from a TASE.2 "
+            "StateSupplemental IndicationPoint -- vendor-defined "
+            "tag/lock/alarm bits. Interpretation per peer.",
+            HFILL }
+        },
+        { &hf_iccp_point_discrete,
+          { "Discrete value", "iccp.point.discrete",
+            FT_INT32, BASE_DEC, NULL, 0x0,
+            "TASE.2 Discrete IndicationPoint integer value (counters, "
+            "set points, mode codes). Distinct from iccp.point.value "
+            "which is the floating-point value of Real-shape points.",
             HFILL }
         },
     };
