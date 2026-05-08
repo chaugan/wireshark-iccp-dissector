@@ -1597,6 +1597,17 @@ iccp_ber_walk_one_data(tvbuff_t *tvb, const guint8 *base, guint8 tag,
                 if (walk_ctx->point_validities) {
                     wmem_array_append_one(walk_ctx->point_validities, vc);
                 }
+                /* Validity histogram (bits 7-6 of quality byte) -- the
+                 * proto-tree walker increments these in maybe_synthesise_point;
+                 * the BER walker has to do the same so the count-axis
+                 * stats fire when MMS aborted before the tree walker
+                 * could see the points. */
+                switch (vc) {
+                    case 0: walk_ctx->points_valid++;    break;
+                    case 1: walk_ctx->points_held++;     break;
+                    case 2: walk_ctx->points_suspect++;  break;
+                    case 3: walk_ctx->points_notvalid++; break;
+                }
                 /* CurrentSource histogram (bits 3-2 of quality byte) --
                  * bumped on every recovered point so the per-PDU and
                  * per-Transfer-Set stats axes show provenance. */
@@ -2096,6 +2107,26 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
         guint tree_pv_n = wmem_array_get_count(out->walk_ctx.point_values);
         if (ber_pv_n > tree_pv_n) {
             out->walk_ctx.point_values = ber_ctx.point_values;
+            /* Also take BER's per-PDU scalar histograms. The proto-tree
+             * walker's counters are zero when MMS aborted (which is
+             * exactly when the BER walker fills in for it); without
+             * this merge the count-axis stats (Point quality,
+             * Point CurrentSource, Points per Transfer Set) read
+             * zero on every truncated frame even though the float /
+             * bit-string arrays are correct. */
+            out->walk_ctx.points_valid       = ber_ctx.points_valid;
+            out->walk_ctx.points_held        = ber_ctx.points_held;
+            out->walk_ctx.points_suspect     = ber_ctx.points_suspect;
+            out->walk_ctx.points_notvalid    = ber_ctx.points_notvalid;
+            out->walk_ctx.points_telemetered = ber_ctx.points_telemetered;
+            out->walk_ctx.points_calculated  = ber_ctx.points_calculated;
+            out->walk_ctx.points_entered     = ber_ctx.points_entered;
+            out->walk_ctx.points_estimated   = ber_ctx.points_estimated;
+            /* point_index = how many points we counted; align with
+             * the merged array length so ti2->point_count reflects
+             * what was actually decoded (BER recovery doesn't
+             * increment point_index per-leaf). */
+            out->walk_ctx.point_index        = ber_pv_n;
         }
         guint ber_ps_n = wmem_array_get_count(ber_ctx.point_slots);
         guint tree_ps_n = wmem_array_get_count(out->walk_ctx.point_slots);
