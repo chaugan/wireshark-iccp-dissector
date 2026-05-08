@@ -2484,6 +2484,47 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
                 proto_item *qi = proto_tree_add_string(psub, hf_iccp_point_quality,
                                                        tvb, 0, 0, vc_str);
                 proto_item_set_generated(qi);
+
+                /* Per-point timestamp (TASE.2 RealQTimeTag /
+                 * RealQTimeTagExtended). The BER walker appended one
+                 * iccp_point_time_t per binary-time leaf, in lock-step
+                 * with point_values; only emit if this point actually
+                 * has one (zero entries indicate RealQ shape). */
+                guint nt = a.walk_ctx.point_timestamps
+                    ? wmem_array_get_count(a.walk_ctx.point_timestamps) : 0;
+                if (i < nt) {
+                    const iccp_point_time_t *pt =
+                        (const iccp_point_time_t *)wmem_array_index(
+                            a.walk_ctx.point_timestamps, i);
+                    if (pt->ts.secs != 0 || pt->ts.nsecs != 0
+                        || pt->has_time_only) {
+                        proto_item *ti = proto_tree_add_time(psub,
+                                                             hf_iccp_point_timestamp,
+                                                             tvb, 0, 0, &pt->ts);
+                        proto_item_set_generated(ti);
+                        if (pt->has_ms_extended) {
+                            proto_item *xi2 = proto_tree_add_uint(psub,
+                                                                  hf_iccp_point_timestamp_ms_extended,
+                                                                  tvb, 0, 0,
+                                                                  pt->ms_extended);
+                            proto_item_set_generated(xi2);
+                        }
+                        if (!pt->has_time_only) {
+                            nstime_t age;
+                            nstime_delta(&age, &pinfo->abs_ts, &pt->ts);
+                            proto_item *ai = proto_tree_add_time(psub,
+                                                                 hf_iccp_point_timestamp_age,
+                                                                 tvb, 0, 0, &age);
+                            proto_item_set_generated(ai);
+                        }
+                        /* Append the timestamp to the collapsed parent
+                         * row so analysts can scan the recovered-points
+                         * list without expanding every entry. */
+                        char tsbuf[40];
+                        iccp_format_point_time(tsbuf, sizeof tsbuf, pt);
+                        proto_item_append_text(pit, "  @ %s", tsbuf);
+                    }
+                }
             }
         }
     }
