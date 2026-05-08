@@ -688,6 +688,17 @@ typedef struct {
     guint32  binary_time_count;
     guint32  visible_string_count;
     guint32  octet_string_count;
+    /* Diagnostic counters for MMS Data CHOICE alternatives our decoder
+     * currently ignores. Surfaced in the "Report data summary" line so
+     * we can see at a glance whether a vendor encodes timestamps as
+     * UtcTime [17] / GeneralizedTime [11] / Real [8] / Bcd [13] etc.
+     * Non-zero on any of these is a hint that we need to add per-point
+     * decode for that alternative. */
+    guint32  utc_time_count;          /* MMS Data utc-time [17] = 0x91 */
+    guint32  generalized_time_count;  /* MMS Data generalized-time [11] = 0x8b */
+    guint32  real_count;              /* MMS Data real [8] = 0x88 */
+    guint32  bcd_count;               /* MMS Data bcd [13] = 0x8d */
+    guint32  mms_string_count;        /* MMS Data mMSString [16] = 0x90 */
 } iccp_pdu_flags_t;
 
 /* TASE.2 name scope. A name in MMS lives either in the VMD's global
@@ -1512,6 +1523,21 @@ iccp_ber_walk_one_data(tvbuff_t *tvb, const guint8 *base, guint8 tag,
         case 0x8a: /* visible-string [10] */
             flags->visible_string_count++;
             break;
+        case 0x88: /* real [8] -- alternate float encoding */
+            flags->real_count++;
+            break;
+        case 0x8b: /* generalized-time [11] */
+            flags->generalized_time_count++;
+            break;
+        case 0x8d: /* bcd [13] */
+            flags->bcd_count++;
+            break;
+        case 0x90: /* mMSString [16] */
+            flags->mms_string_count++;
+            break;
+        case 0x91: /* utc-time [17] -- vendor-specific timestamp encoding */
+            flags->utc_time_count++;
+            break;
         case 0x8c: /* binary-time [12] -- TASE.2 RealQTimeTag (BinaryTime6 = 6 bytes)
                     * or RealQTimeTagExtended (BinaryTime8 = 8 bytes), or rare
                     * BinaryTime4 (4 bytes, time-of-day only). */
@@ -1874,6 +1900,11 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
         ICCP_MAX_FIELD(binary_time_count);
         ICCP_MAX_FIELD(visible_string_count);
         ICCP_MAX_FIELD(octet_string_count);
+        ICCP_MAX_FIELD(utc_time_count);
+        ICCP_MAX_FIELD(generalized_time_count);
+        ICCP_MAX_FIELD(real_count);
+        ICCP_MAX_FIELD(bcd_count);
+        ICCP_MAX_FIELD(mms_string_count);
         #undef ICCP_MAX_FIELD
 
         /* Op-detection booleans set by iccp_ber_recover from the PDU's
@@ -2367,14 +2398,21 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
                                                  tvb, 0, 0, structured);
         proto_item_set_generated(bit);
 
-        char summary[160];
+        char summary[256];
         g_snprintf(summary, sizeof summary,
-                   "floats=%u bit-strings=%u binary-times=%u visible-strings=%u octet-strings=%u",
+                   "floats=%u bit-strings=%u binary-times=%u visible-strings=%u "
+                   "octet-strings=%u utc-times=%u generalized-times=%u "
+                   "reals=%u bcds=%u mms-strings=%u",
                    a.flags.floating_point_count,
                    a.flags.bit_string_count,
                    a.flags.binary_time_count,
                    a.flags.visible_string_count,
-                   a.flags.octet_string_count);
+                   a.flags.octet_string_count,
+                   a.flags.utc_time_count,
+                   a.flags.generalized_time_count,
+                   a.flags.real_count,
+                   a.flags.bcd_count,
+                   a.flags.mms_string_count);
         proto_item *sumit = proto_tree_add_string(itree, hf_iccp_report_summary,
                                                   tvb, 0, 0, summary);
         proto_item_set_generated(sumit);
