@@ -58,6 +58,7 @@
 #include <wsutil/wmem/wmem_map.h>
 #include <wsutil/wmem/wmem_array.h>
 #include <epan/uat.h>
+#include <epan/export_object.h>
 #include <epan/proto_data.h>
 #include <epan/dissectors/packet-ber.h>
 #include <epan/epan_dissect.h>
@@ -87,6 +88,16 @@ extern void *uat_add_record(uat_t *uat, const void *orig_rec_ptr, bool valid_rec
  * By re-queuing the saved first-pass data, the stats callback always
  * sees correct values. */
 #define ICCP_TAP_SAVED_KEY   0xCAFEBAC0u
+/* Per-frame guard for the DefineNVL parse + auto-DSD map population
+ * + Export Objects tap queue inside iccp_dsd_capture(). Without this,
+ * every retap (stats Apply / dialog reopen / -z run) re-parses the
+ * same DefineNVL bytes, allocates new wmem_file_scope strings + key
+ * + variable-name array, overwrites the previous entry in the auto
+ * map, and pushes a duplicate row into File -> Export Objects -> ICCP.
+ * Codex flagged this in the v0.8 design review -- distinct from
+ * ICCP_TAP_QUEUED_KEY because Define-NVL parsing happens before the
+ * regular tap is queued and is gated on a different precondition. */
+#define ICCP_DSD_CAPTURED_KEY 0xCAFEBAC1u
 
 /* Set at handoff. NULL if MMS isn't loaded into Wireshark (very rare). */
 static dissector_handle_t mms_handle = NULL;
@@ -166,6 +177,14 @@ static int hf_iccp_point_timestamp_age         = -1;
 static int hf_iccp_point_state                 = -1;
 static int hf_iccp_point_state_supplemental    = -1;
 static int hf_iccp_point_discrete              = -1;
+/* Per-PDU TASE.2 Transfer_Set_Time_Stamp -- wall-clock UTC the source
+ * RTU assigned to the report at assembly time. Encoded on the wire as
+ * a 4-byte MMS INTEGER (Data CHOICE alt [5] IMPLICIT, tag 0x85) at the
+ * slot whose DSD-resolved variable name is "Transfer_Set_Time_Stamp"
+ * (typically slot 1). One timestamp per report, applied to every
+ * point unless a per-point BinaryTime overrides it. */
+static int hf_iccp_transfer_set_timestamp      = -1;
+static int hf_iccp_transfer_set_timestamp_slot = -1;
 
 /* Forward declaration: the user-supplied DSD-mapping UAT lives further
  * down in the file (next to its registration in proto_register_iccp);
@@ -174,8 +193,24 @@ static int hf_iccp_point_discrete              = -1;
 static const char *iccp_dsd_lookup(const char *domain,
                                    const char *transfer_set,
                                    guint32 slot);
-static void        iccp_dsd_capture(tvbuff_t *tvb);
+static void        iccp_dsd_capture(tvbuff_t *tvb, packet_info *pinfo);
 static void        iccp_dsd_auto_reset(void);
+
+/* Payload queued on the Export Objects tap for File -> Export Objects ->
+ * ICCP. One queued event per DefineNamedVariableList-Request frame that
+ * iccp_dsd_capture parsed successfully. Strings live in wmem_file_scope
+ * (same allocator as iccp_dsd_auto), so the tap callback must g_strdup
+ * before handing anything to export_object_entry_t (Wireshark frees the
+ * entry via g_free, not via the wmem allocator). */
+typedef struct {
+    guint32       pkt_num;
+    const char   *domain;       /* may be NULL or "" for VMD-scope lists */
+    const char   *list_name;    /* always non-NULL when queued */
+    guint         slot_count;
+    char        **slot_names;   /* slot_count cstrings, in slot order */
+} iccp_dsd_tap_info_t;
+
+static int iccp_dsd_eo_tap = -1;
 static gboolean    iccp_ber_read_object_name(const guint8 **p,
                                              const guint8 *end,
                                              wmem_allocator_t *scope,
@@ -223,6 +258,14 @@ static int st_node_points_per_pdu   = -1;  /* per-PDU:  point_count distribution
 static int st_node_success_ratio    = -1;  /* per-PDU:  AccessResult success ratio */
 static int st_node_quality_mix      = -1;  /* per-PDU:  validity-class fractions */
 static int st_node_pdu_sizes        = -1;  /* per-PDU:  frame length, with per-Op breakdown */
+/* Opt-in (preference iccp.stats_per_point_name): per-point-name leaves
+ * nested under each Transfer Set. Default off because Statkraft-scale
+ * captures (thousands of distinct slot names) can slow stats retap. */
+static int st_node_points_byname    = -1;  /* count tree:  TransferSet -> point name -> tick */
+static int st_node_pvalues_byname   = -1;  /* float tree:  TransferSet -> point name -> avg/min/max */
+
+/* Bool preference: when TRUE, populate the per-point-name leaves above. */
+static gboolean iccp_pref_stats_per_point_name = FALSE;
 
 /* Tap payload: everything a listener (stats_tree, custom Lua tap, an
  * external analysis) might reasonably want to know about a single ICCP
@@ -279,6 +322,12 @@ typedef struct {
      * to VALID/HELD/SUSPECT/NOT_VALID. */
     wmem_array_t  *point_values_arr;
     wmem_array_t  *point_validities_arr;
+    /* Parallel to point_values_arr when populated by the BER walker
+     * (one slot index per numeric point). May be shorter than
+     * point_values_arr when the proto-tree walker dominated (it doesn't
+     * track slots) -- consumers must check the array lengths agree
+     * before indexing in lock-step. */
+    wmem_array_t  *point_slots_arr;
 } iccp_tap_info_t;
 
 /* We do not cache MMS hf indices: walk_tree() matches fields by
@@ -1010,7 +1059,25 @@ typedef struct {
      * Strings are pinfo->pool-scoped (live for the dissection only). */
     const char *ds_domain;
     const char *ds_item;
+    /* Every slot-level 4-byte MMS INTEGER (Data CHOICE alt [5] / [6]
+     * IMPLICIT, tag 0x85 / 0x86) seen at the outer listOfAccessResult
+     * level (depth == 0). The post-walk consumer iterates this list,
+     * looks each candidate's slot up against the DSD, and promotes the
+     * one whose name matches "Transfer_Set_Time_Stamp" (and whose
+     * value falls in a Y2000..Y2100 Unix-seconds window) to the
+     * iccp.transfer_set.timestamp field. Capturing every candidate --
+     * not just the first -- guards against DSDs where a non-timestamp
+     * INTEGER appears at a lower slot than the actual timestamp
+     * (Codex review caught this). Only the BER walker populates this;
+     * the proto-tree walker doesn't track slot-typed integers.
+     * Element type is iccp_ts_candidate_t (forward-declared below). */
+    wmem_array_t *ts_candidates;
 } iccp_walk_ctx_t;
+
+typedef struct {
+    guint32 slot;       /* listOfAccessResult slot index (0-based) */
+    guint32 raw;        /* 4-byte BE INTEGER as unsigned */
+} iccp_ts_candidate_t;
 
 static void attach_decoded_values(proto_node *node, gpointer user_data);
 
@@ -1640,6 +1707,26 @@ iccp_ber_walk_one_data(tvbuff_t *tvb, const guint8 *base, guint8 tag,
             break;
         case 0x85: /* integer [5] */
         case 0x86: /* unsigned [6] */
+            /* Capture every slot-level 4-byte INTEGER as a candidate
+             * Transfer_Set_Time_Stamp. Depth == 0 means we are at the
+             * outer listOfAccessResult level (nested structures recurse
+             * with depth+1) so this won't pick up INTEGER values inside
+             * DiscreteQTimeTag-style per-point structures. The
+             * post-walk consumer cross-references each candidate's
+             * slot against the DSD-resolved variable name and only
+             * promotes one whose name matches "Transfer_Set_Time_Stamp"
+             * to an absolute time. Multiple candidates are kept because
+             * a DSD may legitimately place a non-timestamp INTEGER at
+             * a lower slot than the actual timestamp. */
+            if (depth == 0 && len == 4 && walk_ctx && walk_ctx->ts_candidates) {
+                iccp_ts_candidate_t c;
+                c.slot = slot;
+                c.raw  =   ((guint32)content[0] << 24)
+                         | ((guint32)content[1] << 16)
+                         | ((guint32)content[2] <<  8)
+                         |  (guint32)content[3];
+                wmem_array_append_one(walk_ctx->ts_candidates, c);
+            }
             break;
         case 0x87: /* floating-point [7] */
             flags->floating_point_count++;
@@ -1990,6 +2077,7 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
     out->walk_ctx.point_validities = wmem_array_new(array_scope, sizeof(guint8));
     out->walk_ctx.point_slots      = wmem_array_new(array_scope, sizeof(guint32));
     out->walk_ctx.point_timestamps = wmem_array_new(array_scope, sizeof(iccp_point_time_t));
+    out->walk_ctx.ts_candidates    = wmem_array_new(array_scope, sizeof(iccp_ts_candidate_t));
     /* Wire timestamp of the current frame; used by maybe_synthesise_point
      * to compute iccp.point.timestamp.age = frame_abs_ts - point.timestamp.
      * pinfo->abs_ts is set by Wireshark from the pcap packet header. */
@@ -2020,6 +2108,7 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
         ber_ctx.point_values     = wmem_array_new(array_scope, sizeof(gfloat));
         ber_ctx.point_validities = wmem_array_new(array_scope, sizeof(guint8));
         ber_ctx.point_slots      = wmem_array_new(array_scope, sizeof(guint32));
+        ber_ctx.ts_candidates    = wmem_array_new(array_scope, sizeof(iccp_ts_candidate_t));
         /* Make the BER walker emit hidden iccp.point.value /
          * iccp.quality items into the same tree we were given. Hidden
          * means they don't show in the proto tree pane (the visible
@@ -2145,6 +2234,19 @@ iccp_analyse_tree(packet_info *pinfo, proto_tree *tree, tvbuff_t *tvb,
             out->walk_ctx.ds_domain = ber_ctx.ds_domain;
         if (ber_ctx.ds_item && !out->walk_ctx.ds_item)
             out->walk_ctx.ds_item   = ber_ctx.ds_item;
+        /* Same for the Transfer_Set_Time_Stamp candidates -- only the
+         * BER walker captures slot-level integers. Use BER's array
+         * when it has more entries (canonical, derived from raw
+         * bytes), mirroring the merge policy applied to point arrays
+         * just above. */
+        if (ber_ctx.ts_candidates) {
+            guint ber_tc_n  = wmem_array_get_count(ber_ctx.ts_candidates);
+            guint tree_tc_n = out->walk_ctx.ts_candidates
+                ? wmem_array_get_count(out->walk_ctx.ts_candidates) : 0;
+            if (ber_tc_n > tree_tc_n) {
+                out->walk_ctx.ts_candidates = ber_ctx.ts_candidates;
+            }
+        }
     }
 
     out->op = classify_operation(&out->flags);
@@ -2327,6 +2429,17 @@ iccp_emit_tap(packet_info *pinfo,
         wmem_array_append(ti2->point_validities_arr,
                           wmem_array_index(walk_ctx->point_validities, 0), n);
     }
+    /* Mirror slot indices into file-scope storage. Only populated by the
+     * BER walker (case 0x87 floating-point appends one slot per numeric
+     * point); the proto-tree walker leaves point_slots empty, in which
+     * case the count check at stats-tree time prevents indexing past
+     * the end of this array. */
+    if (walk_ctx->point_slots && wmem_array_get_count(walk_ctx->point_slots) > 0) {
+        guint n = wmem_array_get_count(walk_ctx->point_slots);
+        ti2->point_slots_arr = wmem_array_new(wmem_file_scope(), sizeof(guint32));
+        wmem_array_append(ti2->point_slots_arr,
+                          wmem_array_index(walk_ctx->point_slots, 0), n);
+    }
 
     /* Always save in file scope so retaps find good first-pass data,
      * even if no tap listener is active yet (the GUI registers the
@@ -2464,7 +2577,7 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
      * InformationReports get slot->name mapping without manual UAT
      * entry. Idempotent on retap (same bytes -> same content). */
     if (a.op == ICCP_OP_DEFINE_NVL_REQ)
-        iccp_dsd_capture(tvb);
+        iccp_dsd_capture(tvb, pinfo);
 
     /* Re-enable writes (MMS / IEC61850 may have frozen them), clear
      * any fence (a fence forces append instead of replace), then
@@ -2605,6 +2718,70 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
                                                   tvb, 0, 0, summary);
         proto_item_set_generated(sumit);
 
+        /* Transfer Set timestamp (per-PDU). The BER walker captured
+         * every slot-level 4-byte INTEGER from listOfAccessResult into
+         * a.walk_ctx.ts_candidates. Iterate the candidates and promote
+         * the one whose DSD-resolved variable name is exactly the
+         * TASE.2 spec name "Transfer_Set_Time_Stamp" AND whose value
+         * falls in a Y2000..Y2100 Unix-seconds plausibility window
+         * (946684800 = 2000-01-01, 4102444800 = 2100-01-01). Failure
+         * of either guard at every candidate means there's no Transfer
+         * Set timestamp on the wire (e.g. DS_ANA_STATKR_L puts a
+         * DSConditions bit-mask at slot 1, with no INTEGER timestamp
+         * anywhere); we silently decline. The decoded short-form
+         * string is also reused below to annotate each per-point row,
+         * mirroring how the paid Kema tool shows the report time next
+         * to every point. */
+        char pdu_ts_str[32]; pdu_ts_str[0] = '\0';
+        guint nc = a.walk_ctx.ts_candidates
+            ? wmem_array_get_count(a.walk_ctx.ts_candidates) : 0;
+        if (nc > 0) {
+            const char *lookup_dom  = a.walk_ctx.ds_domain
+                ? a.walk_ctx.ds_domain
+                : (a.scan.domain_id ? a.scan.domain_id : "");
+            const char *lookup_item = a.walk_ctx.ds_item
+                ? a.walk_ctx.ds_item
+                : (a.scan.matched_name ? a.scan.matched_name : "");
+            for (guint k = 0; k < nc; k++) {
+                const iccp_ts_candidate_t *c =
+                    (const iccp_ts_candidate_t *)wmem_array_index(
+                        a.walk_ctx.ts_candidates, k);
+                const char *ts_vname = iccp_dsd_lookup(
+                    lookup_dom, lookup_item, c->slot);
+                if (!ts_vname
+                    || g_strcmp0(ts_vname, "Transfer_Set_Time_Stamp") != 0)
+                    continue;
+                if (c->raw < 946684800u || c->raw >= 4102444800u)
+                    continue;
+
+                nstime_t pdu_ts = { .secs = (time_t)c->raw, .nsecs = 0 };
+                proto_item *tsit = proto_tree_add_time(itree,
+                                                       hf_iccp_transfer_set_timestamp,
+                                                       tvb, 0, 0, &pdu_ts);
+                proto_item_set_generated(tsit);
+                proto_item *tssit = proto_tree_add_uint(itree,
+                                                        hf_iccp_transfer_set_timestamp_slot,
+                                                        tvb, 0, 0, c->slot);
+                proto_item_set_generated(tssit);
+                /* Format as HH:MM:SS UTC for the per-point annotation
+                 * below. Short form keeps each Point #N row scannable;
+                 * the full timestamp is on the top-level field above
+                 * for filtering and IO-graph use. Use the same #ifdef
+                 * pattern as iccp_format_point_time so MSVC links. */
+                time_t secs = (time_t)c->raw;
+                struct tm tmv;
+#ifdef _WIN32
+                if (gmtime_s(&tmv, &secs) == 0) {
+#else
+                if (gmtime_r(&secs, &tmv)) {
+#endif
+                    strftime(pdu_ts_str, sizeof pdu_ts_str,
+                             "%H:%M:%S UTC", &tmv);
+                }
+                break;       /* first valid match wins */
+            }
+        }
+
         /* Recovered points subtree. The MMS dissector aborts at item ~2
          * of any SEQUENCE OF Data due to mms.c:2103, so the proto-tree
          * pane only shows 1-2 of the actual N AccessResult items even
@@ -2702,6 +2879,30 @@ dissect_iccp(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void *data _U_
                         /* Update the parent row text so the name shows
                          * inline without needing to expand. */
                         proto_item_append_text(pit, "  →  %s", vname);
+                    }
+                }
+                /* Annotate the parent row with the per-PDU Transfer Set
+                 * timestamp -- but only when this point does NOT carry
+                 * its own per-point BinaryTime (RealQTimeTag etc.). The
+                 * per-point override is checked below; here we look
+                 * ahead at the same array. If both timestamps exist for
+                 * the same point, the per-point one wins (it's more
+                 * specific) and the per-PDU stamp is only shown at the
+                 * top-level iccp.transfer_set.timestamp field. */
+                if (pdu_ts_str[0]) {
+                    gboolean has_per_point_ts = FALSE;
+                    guint nt_chk = a.walk_ctx.point_timestamps
+                        ? wmem_array_get_count(a.walk_ctx.point_timestamps) : 0;
+                    if (i < nt_chk) {
+                        const iccp_point_time_t *pt_chk =
+                            (const iccp_point_time_t *)wmem_array_index(
+                                a.walk_ctx.point_timestamps, i);
+                        has_per_point_ts = (pt_chk->ts.secs != 0
+                                            || pt_chk->ts.nsecs != 0
+                                            || pt_chk->has_time_only);
+                    }
+                    if (!has_per_point_ts) {
+                        proto_item_append_text(pit, "  @ %s", pdu_ts_str);
                     }
                 }
                 proto_item *vi = proto_tree_add_double(psub, hf_iccp_point_value,
@@ -2839,6 +3040,20 @@ iccp_stats_tree_init(stats_tree *st)
     st_node_success_ratio  = stats_tree_create_node(st, "Report success ratio per PDU",         0, STAT_DT_FLOAT, FALSE);
     st_node_quality_mix    = stats_tree_create_node(st, "Quality mix per PDU (%)",              0, STAT_DT_FLOAT, TRUE);
     st_node_pdu_sizes      = stats_tree_create_node(st, "PDU sizes (bytes)",                    0, STAT_DT_FLOAT, TRUE);
+
+    /* Opt-in: only materialise the per-point-name axes when the preference
+     * is enabled at dialog-open time. Toggling the preference while a stats
+     * dialog is open won't re-run init; the user has to close and reopen
+     * the dialog (Statistics -> ICCP/Statistics) to pick up the change. */
+    if (iccp_pref_stats_per_point_name) {
+        st_node_points_byname  = stats_tree_create_node(st,
+            "Points by name (per Transfer Set)",       0, STAT_DT_INT,   TRUE);
+        st_node_pvalues_byname = stats_tree_create_node(st,
+            "Point values by name (per Transfer Set)", 0, STAT_DT_FLOAT, TRUE);
+    } else {
+        st_node_points_byname  = -1;
+        st_node_pvalues_byname = -1;
+    }
 }
 
 static tap_packet_status
@@ -3001,6 +3216,59 @@ iccp_stats_tree_packet(stats_tree *st,
 
                 avg_stat_node_add_value_float(st, "Point values by Conformance Block", 0,                  TRUE,  v);
                 avg_stat_node_add_value_float(st, cb_label,                            st_node_pvalues_cb, FALSE, v);
+            }
+
+            /* Opt-in per-point-name axes. Only when the preference was on
+             * at dialog-open time (the create_node calls in init are
+             * conditional on the same flag). Two-step traversal: nest the
+             * Transfer-Set name under the top-level node, then place
+             * per-point-name leaves under the Transfer-Set parent using
+             * the id the first call returns -- this is how stats_tree
+             * supports dynamic 3-level trees without pre-registering every
+             * possible parent. Falls back to "slot N (unresolved)" when
+             * the slot is known but no name was discovered, and skips
+             * the axis entirely when slots aren't parallel to values
+             * (proto-tree-only path leaves point_slots empty). */
+            if (iccp_pref_stats_per_point_name
+                && st_node_points_byname  >= 0
+                && st_node_pvalues_byname >= 0
+                && ti->point_slots_arr
+                && wmem_array_get_count(ti->point_slots_arr) == n) {
+                const char *lookup_dom  = ti->domain_id ? ti->domain_id : "";
+                const char *lookup_item = (ti->set_name && *ti->set_name)
+                                            ? ti->set_name : "";
+                char unresolved[32];
+                for (guint i = 0; i < n; i++) {
+                    const gfloat v_pt = *(gfloat *)wmem_array_index(ti->point_values_arr, i);
+                    const guint32 slot = *(guint32 *)wmem_array_index(ti->point_slots_arr, i);
+                    const char *vname = iccp_dsd_lookup(lookup_dom, lookup_item, slot);
+                    const char *label;
+                    if (vname) {
+                        label = vname;
+                    } else {
+                        g_snprintf(unresolved, sizeof unresolved,
+                                   "slot %u (unresolved)", slot);
+                        label = unresolved;
+                    }
+
+                    /* Tick root -> TS -> leaf so the parent rows roll
+                     * up totals (counts + avg/min/max) instead of
+                     * showing 0 / blank. Same root-then-child pattern
+                     * the count axes elsewhere in this file use. */
+                    tick_stat_node(st, "Points by name (per Transfer Set)",
+                                   0, TRUE);
+                    int count_parent = tick_stat_node(st, set,
+                                                      st_node_points_byname, TRUE);
+                    tick_stat_node(st, label, count_parent, FALSE);
+
+                    avg_stat_node_add_value_float(st,
+                        "Point values by name (per Transfer Set)",
+                        0, TRUE, v_pt);
+                    int float_parent = avg_stat_node_add_value_float(
+                        st, set, st_node_pvalues_byname, TRUE, v_pt);
+                    avg_stat_node_add_value_float(
+                        st, label, float_parent, FALSE, v_pt);
+                }
             }
         }
     }
@@ -3199,12 +3467,30 @@ iccp_ber_read_object_name(const guint8 **p, const guint8 *end,
 }
 
 /* Capture a DSD from a DefineNamedVariableList-Request PDU. Tolerant:
- * any structural mismatch returns silently. Idempotent: re-visiting a
- * frame replaces the entry with the same content. */
+ * any structural mismatch returns silently. Idempotent across retaps:
+ * a pinfo->pool proto-data guard (ICCP_DSD_CAPTURED_KEY) short-circuits
+ * the second visit to the same frame, so the auto-DSD map and the
+ * Export Objects tap each see one event per Define-NVL on the wire
+ * regardless of how many retap cycles Wireshark drives. When pinfo
+ * is non-NULL and a tap listener is active on iccp_dsd_eo_tap (the
+ * Export Objects listener registered via register_export_object), the
+ * function also queues one tap event per successfully parsed DSD --
+ * that powers File -> Export Objects -> ICCP. */
 static void
-iccp_dsd_capture(tvbuff_t *tvb)
+iccp_dsd_capture(tvbuff_t *tvb, packet_info *pinfo)
 {
     if (!tvb) return;
+
+    /* Idempotency guard. Skip the parse entirely if we've already
+     * processed this frame in this pinfo lifetime (= one
+     * dissect/retap cycle for the same frame number). The auto map's
+     * file-scope strings from the first pass remain valid; not
+     * rebuilding avoids leaking memory and avoids re-queuing a
+     * duplicate EO tap event. */
+    if (pinfo && p_get_proto_data(pinfo->pool, pinfo, proto_iccp,
+                                  ICCP_DSD_CAPTURED_KEY)) {
+        return;
+    }
     gint avail = tvb_captured_length(tvb);
     if (avail < 6) return;
     const guint8 *base = tvb_get_ptr(tvb, 0, avail);
@@ -3264,6 +3550,97 @@ iccp_dsd_capture(tvbuff_t *tvb)
         }
         p = item_end;
     }
+
+    /* Mark this frame as DSD-captured so a retap (stats Apply, dialog
+     * reopen, etc.) doesn't re-parse, re-allocate file-scope strings,
+     * or re-queue the EO event. The guard pointer's value is unused;
+     * presence is what matters. */
+    if (pinfo) {
+        p_add_proto_data(pinfo->pool, pinfo, proto_iccp,
+                         ICCP_DSD_CAPTURED_KEY, GINT_TO_POINTER(1));
+    }
+
+    /* Queue an Export Objects tap event so File -> Export Objects -> ICCP
+     * lists this DSD. The slot_names array references the same
+     * wmem_file_scope strings already in iccp_dsd_auto -- no copy here;
+     * the EO callback g_strdup's into Wireshark-owned storage. Skipped
+     * silently if no pinfo (legacy callers) or no listener attached. */
+    if (pinfo && have_tap_listener(iccp_dsd_eo_tap)) {
+        guint n = wmem_array_get_count(names);
+        iccp_dsd_tap_info_t *info = wmem_new0(scope, iccp_dsd_tap_info_t);
+        info->pkt_num    = pinfo->num;
+        info->domain     = list_dom;
+        info->list_name  = list_item;
+        info->slot_count = n;
+        if (n > 0) {
+            info->slot_names = (char **)wmem_alloc(scope, n * sizeof(char *));
+            for (guint i = 0; i < n; i++) {
+                info->slot_names[i] = *(char **)wmem_array_index(names, i);
+            }
+        }
+        tap_queue_packet(iccp_dsd_eo_tap, pinfo, info);
+    }
+}
+
+/* Export Objects packet callback. One call per DefineNVL tap event;
+ * builds a CSV (slot,var_name) and hands the entry to the EO list. The
+ * EO framework owns the entry afterwards and frees fields via g_free,
+ * so every string given here must come from GLib allocation. */
+static tap_packet_status
+eo_iccp_packet_cb(void *tapdata, packet_info *pinfo _U_,
+                  epan_dissect_t *edt _U_, const void *data,
+                  tap_flags_t flags _U_)
+{
+    export_object_list_t          *object_list = (export_object_list_t *)tapdata;
+    const iccp_dsd_tap_info_t     *info        = (const iccp_dsd_tap_info_t *)data;
+    if (!info || !object_list) return TAP_PACKET_DONT_REDRAW;
+
+    /* CSV body: header + one row per slot. Even empty lists get the
+     * header so the file isn't zero-length on Save. RFC 4180 escape
+     * on the var_name field: wrap in double quotes and double any
+     * embedded double quotes whenever the value contains comma,
+     * quote, CR or LF. Slot is a guint so never needs quoting. */
+    GString *csv = g_string_new("slot,var_name\n");
+    for (guint i = 0; i < info->slot_count; i++) {
+        const char *vn = info->slot_names[i] ? info->slot_names[i] : "";
+        gboolean needs_quoting = (strpbrk(vn, ",\"\r\n") != NULL);
+        if (needs_quoting) {
+            g_string_append_printf(csv, "%u,\"", i);
+            for (const char *p = vn; *p; p++) {
+                if (*p == '"') g_string_append(csv, "\"\"");
+                else           g_string_append_c(csv, *p);
+            }
+            g_string_append(csv, "\"\n");
+        } else {
+            g_string_append_printf(csv, "%u,%s\n", i, vn);
+        }
+    }
+
+    /* Filename: <domain>__<list_name>.csv (or vmd__<list_name>.csv for
+     * VMD-scope lists with no domain). Sanitised through eo_massage_str
+     * so path separators / control characters can't sneak into Save. */
+    const char *dom_for_fn = (info->domain && *info->domain) ? info->domain : "vmd";
+    char *raw_name = g_strdup_printf("%s__%s.csv",
+                                     dom_for_fn,
+                                     info->list_name ? info->list_name : "list");
+    /* eo_massage_str returns a freshly allocated GString; consume it as
+     * a g_malloc'd cstring (g_string_free with free_segment=FALSE hands
+     * the buffer to GLib's allocator, matching what the EO framework
+     * expects). */
+    GString *gs = eo_massage_str(raw_name, EXPORT_OBJECT_MAXFILELEN, 0);
+    g_free(raw_name);
+    char *safe_name = g_string_free(gs, FALSE);
+
+    export_object_entry_t *entry = g_new0(export_object_entry_t, 1);
+    entry->pkt_num      = info->pkt_num;
+    entry->hostname     = g_strdup(info->domain ? info->domain : "");
+    entry->content_type = g_strdup("text/csv");
+    entry->filename     = safe_name;     /* ownership transferred */
+    entry->payload_len  = (size_t)csv->len;
+    entry->payload_data = (guint8 *)g_string_free(csv, FALSE);
+
+    object_list->add_entry(object_list->gui_data, entry);
+    return TAP_PACKET_REDRAW;
 }
 
 /* Reset the auto-DSD map between files. wmem_file_scope memory is freed
@@ -3564,6 +3941,23 @@ proto_register_iccp(void)
             "which is the floating-point value of Real-shape points.",
             HFILL }
         },
+        { &hf_iccp_transfer_set_timestamp,
+          { "Transfer Set timestamp", "iccp.transfer_set.timestamp",
+            FT_ABSOLUTE_TIME, ABSOLUTE_TIME_UTC, NULL, 0x0,
+            "Wall-clock UTC the source RTU assigned to the report at "
+            "assembly time. Decoded from a slot-level MMS INTEGER whose "
+            "DSD variable name is 'Transfer_Set_Time_Stamp'. One value "
+            "per InformationReport; applies to every point in the report "
+            "unless that point carries its own BinaryTime override.",
+            HFILL }
+        },
+        { &hf_iccp_transfer_set_timestamp_slot,
+          { "Transfer Set timestamp slot", "iccp.transfer_set.timestamp.slot",
+            FT_UINT32, BASE_DEC, NULL, 0x0,
+            "Which listOfAccessResult slot carried the Transfer Set "
+            "timestamp (typically 1, but some DSDs put it at 2).",
+            HFILL }
+        },
     };
 
     static gint *ett[] = {
@@ -3644,6 +4038,25 @@ proto_register_iccp(void)
         "iccp.point.slot.",
         iccp_dsd_uat);
 
+    /* Per-point-name stats axes. Default OFF because the leaf count
+     * scales with the union of all named slots across all Transfer Sets
+     * (thousands in real-world Statkraft captures), which materially
+     * slows the stats tree retap and the GUI render. Toggle requires
+     * the user to close and reopen Statistics -> ICCP/Statistics: the
+     * stats_tree init callback samples this preference once per dialog
+     * open and conditionally creates the parent nodes. */
+    prefs_register_bool_preference(iccp_module, "stats_per_point_name",
+        "Per-point-name stats axes",
+        "When enabled, the ICCP/Statistics tree adds two opt-in axes -- "
+        "'Points by name (per Transfer Set)' (counts) and 'Point values "
+        "by name (per Transfer Set)' (avg/min/max float) -- nested as "
+        "TransferSet -> point name. Resolves names via the auto-discovered "
+        "DSDs (DefineNamedVariableList frames in the capture) and the "
+        "manual DSD Mapping above; unresolved slots are labelled 'slot N "
+        "(unresolved)'. Default OFF -- expensive for Statkraft-scale "
+        "captures. Close and reopen the stats dialog after toggling.",
+        &iccp_pref_stats_per_point_name);
+
     /* Reset the auto-discovered DSD map between captures. Memory is
      * wmem_file_scope so Wireshark frees the contents on file close;
      * we just need to drop the dangling static pointer. */
@@ -3655,6 +4068,16 @@ proto_register_iccp(void)
     /* Expose a tap so external listeners (stats_tree, Lua, custom taps)
      * can consume per-packet ICCP attributes. */
     proto_iccp_tap = register_tap("iccp");
+
+    /* Export Objects integration: File -> Export Objects -> ICCP shows
+     * one row per DefineNamedVariableList-Request seen on the wire and
+     * lets the user Save / Save All to CSV (slot,var_name). The
+     * register_export_object call both registers the tap listener and
+     * (on Wireshark 4.2 / 4.4 / 4.6) returns the tap id directly --
+     * stash it for tap_queue_packet inside iccp_dsd_capture. */
+    iccp_dsd_eo_tap = register_export_object(proto_iccp,
+                                             eo_iccp_packet_cb,
+                                             NULL /* reset_cb */);
 
     /* Register the built-in stats tree. Enables:
      *   tshark -z iccp,tree -r file.pcap
